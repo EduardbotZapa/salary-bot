@@ -34,6 +34,67 @@ DATA_DIR.mkdir(exist_ok=True)
 with open("lookup.json", encoding="utf-8") as f:
     LOOKUP: dict = json.load(f)
 
+ORDERS_SHEET_ID = os.environ.get("ORDERS_SHEET_ID", "")
+_live_cache: dict = {}
+_cache_time = None
+
+def refresh_live_lookup():
+    global _live_cache, _cache_time
+    import time
+    now = time.time()
+    # Refresh every 30 minutes
+    if _cache_time and now - _cache_time < 1800:
+        return
+    try:
+        creds_dict = json.loads(GOOGLE_CREDS)
+        scopes = ["https://spreadsheets.google.com/feeds",
+                  "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(ORDERS_SHEET_ID)
+        result = {}
+        for ws in sh.worksheets():
+            src = ws.title
+            rows = ws.get_all_values()
+            if not rows: continue
+            headers = [h.strip() for h in rows[0]]
+            # Find column indices
+            def col(name):
+                for i,h in enumerate(headers):
+                    if name.lower() in h.lower(): return i
+                return -1
+            art_col = col("артикул")
+            uktved_col = col("код товару")
+            duty_col = col("мито")
+            price_col = col("ціна за одиницю")
+            weight_col = col("нетто за 1")
+            brand_col = col("виробник")
+            if art_col < 0: continue
+            for row in rows[1:]:
+                if len(row) <= art_col: continue
+                art = str(row[art_col]).strip()
+                if not art: continue
+                try: price = float(str(row[price_col]).replace(",",".").replace(" ","")) if price_col>=0 and price_col<len(row) else 0
+                except: price = 0
+                try: duty = float(str(row[duty_col]).replace(",",".").replace(" ","").replace("%","")) if duty_col>=0 and duty_col<len(row) else 0.04
+                except: duty = 0.04
+                if duty > 1: duty = duty / 100
+                try: weight = float(str(row[weight_col]).replace(",",".").replace(" ","")) if weight_col>=0 and weight_col<len(row) else 0
+                except: weight = 0
+                result[art] = {
+                    "uktved": str(row[uktved_col]).strip() if uktved_col>=0 and uktved_col<len(row) else "",
+                    "duty": duty,
+                    "cost_eur": price,
+                    "weight": weight,
+                    "brand": str(row[brand_col]).strip() if brand_col>=0 and brand_col<len(row) else "",
+                    "source": src,
+                }
+        _live_cache = result
+        _cache_time = now
+        logger.info(f"Live lookup refreshed: {len(result)} articles")
+    except Exception as e:
+        logger.error(f"Live lookup error: {e}")
+
 # ── Google Sheets ─────────────────────────────────────────────────────────────
 def get_gsheet():
     try:
@@ -178,7 +239,11 @@ def parse_pdf(path: str) -> dict:
             except: pass
     return result
 
-def lookup_article(art): return LOOKUP.get(art, {})
+def lookup_article(art):
+    # Try live cache first, fallback to static lookup.json
+    if ORDERS_SHEET_ID and _live_cache:
+        return _live_cache.get(art, LOOKUP.get(art, {}))
+    return LOOKUP.get(art, {})
 
 # ── Excel builder ─────────────────────────────────────────────────────────────
 def build_excel(manager_name, invoices, month):
@@ -307,6 +372,7 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Спочатку введи ім'я: /start")
         return
 
+    refresh_live_lookup()
     msg = await update.message.reply_text("⏳ Обробляю PDF...")
     doc = update.message.document
     file = await ctx.bot.get_file(doc.file_id)
