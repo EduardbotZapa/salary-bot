@@ -161,12 +161,12 @@ def append_to_sheets(manager_name: str, inv: dict):
             source = lu.get("source","")
             is_stock = item.get("is_stock", False)
 
-            # W = виторг - (прайс * курс * кількість)
+            # W = різниця з прайсом = надбавка менеджера
             w = round(revenue - price_eur * rate * item["qty"], 2) if (is_stock and price_eur) else 0
-            # S = (виторг - собів.загал) - W
-            s = round((revenue - cost_total) - w, 2) if is_stock else round(profit, 2)
-            # T = W (надбавка менеджера)
-            t = w if is_stock else 0
+            # S = W = надбавка менеджера понад прайс (колонка Прибуток-%)
+            s = w if is_stock else round(profit, 2)
+            # T = (виторг - собів.загал) - W = прибуток від прайсової частини
+            t = round((revenue - cost_total) - w, 2) if is_stock else 0
 
             # Weight by source
             weight_china = round(weight_unit * item["qty"], 3) if (is_stock and "китай" in source.lower()) else 0
@@ -318,8 +318,8 @@ def build_excel(manager_name, invoices, month):
             w_unit = lu.get("weight",0)
             source = lu.get("source","")
             wx = round(revenue - price_eur*rate*item["qty"],2) if (is_stock and price_eur) else 0
-            s_val = round((revenue-cost_total)-wx,2) if is_stock else round(profit,2)
-            t_val = wx if is_stock else 0
+            s_val = wx if is_stock else round(profit,2)
+            t_val = round((revenue-cost_total)-wx,2) if is_stock else 0
             w_china = round(w_unit*item["qty"],3) if (is_stock and "китай" in source.lower()) else 0
             w_eu    = round(w_unit*item["qty"],3) if (is_stock and "e-trade" in source.lower()) else 0
             vals = [inv.get("client",""),inv.get("invoice_num",""),inv.get("date",""),
@@ -705,7 +705,10 @@ def main():
         states={
             WAIT_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, set_name)],
             WAIT_DATE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date)],
-            WAIT_STOCK:    [MessageHandler(filters.TEXT, handle_stock)],
+            WAIT_STOCK:    [
+                CallbackQueryHandler(callback_stock, pattern="^stock_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stock),
+            ],
             WAIT_DELIVERY: [MessageHandler(filters.TEXT, handle_delivery),
                             CommandHandler("0", handle_delivery)],
         },
@@ -713,7 +716,6 @@ def main():
         allow_reentry=True,
     )
     app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(callback_stock, pattern="^stock_"))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("sheet", cmd_sheet))
