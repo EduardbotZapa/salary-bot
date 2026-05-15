@@ -207,8 +207,60 @@ def load_user(uid):
 def save_user(uid, data):
     _uf(uid).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-# ── NBU rate ──────────────────────────────────────────────────────────────────
+# ── Minfin interbank rate ─────────────────────────────────────────────────────
 async def get_nbu_rate(date_str: str):
+    """Get EUR interbank buy rate from minfin.com.ua + markup %"""
+    try:
+        dt = datetime.strptime(date_str, "%d.%m.%Y")
+        # minfin archive URL format: /currency/mb/eur/YYYY-MM-DD/
+        url = f"https://minfin.com.ua/currency/mb/eur/{dt:%Y-%m-%d}/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "uk,ru;q=0.9",
+        }
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            r = await client.get(url, headers=headers)
+            text = r.text
+
+        # Find buy rate in page - pattern: "можна було купити ... по курсу межбанка X"
+        import re as re_mod
+        # Try JSON data embedded in page
+        m = re_mod.search(r'"buy"\s*:\s*"?([\d.]+)"?', text)
+        if not m:
+            # Try alternative pattern from page text
+            m = re_mod.search(r'по курсу межбанка\s+([\d.,]+)', text)
+        if not m:
+            # Try to find rate in table data
+            m = re_mod.search(r'['"]([\d]{2}[.,][\d]{3,4})['"]', text)
+
+        if m:
+            rate_str = m.group(1).replace(',', '.')
+            rate = float(rate_str)
+            if 30 < rate < 200:  # sanity check
+                final = round(rate * (1 + RATE_MARKUP / 100), 4)
+                logger.info(f"Minfin rate {date_str}: {rate} + {RATE_MARKUP}% = {final}")
+                return final
+
+        # Fallback: try minfin API endpoint
+        api_url = f"https://minfin.com.ua/api/currency/mb/?currency=eur&date={dt:%Y-%m-%d}"
+        async with httpx.AsyncClient(timeout=8) as client:
+            r2 = await client.get(api_url, headers=headers)
+            if r2.status_code == 200:
+                data = r2.json()
+                if isinstance(data, list) and data:
+                    rate = float(data[0].get("buy", 0) or data[0].get("rate", 0))
+                    if rate > 0:
+                        return round(rate * (1 + RATE_MARKUP / 100), 4)
+                elif isinstance(data, dict):
+                    rate = float(data.get("buy", 0) or data.get("rate", 0))
+                    if rate > 0:
+                        return round(rate * (1 + RATE_MARKUP / 100), 4)
+
+    except Exception as e:
+        logger.warning(f"Minfin rate error: {e}")
+
+    # Final fallback: NBU
     try:
         dt = datetime.strptime(date_str, "%d.%m.%Y")
         url = f"https://bank.gov.ua/NBU_Exchange/exchange_site?start={dt:%Y%m%d}&end={dt:%Y%m%d}&valcode=EUR&sort=exchangedate&order=desc&json"
@@ -216,9 +268,12 @@ async def get_nbu_rate(date_str: str):
             r = await client.get(url)
             data = r.json()
             if data:
-                return round(float(data[0]["rate"]) * (1 + RATE_MARKUP / 100), 4)
+                rate = float(data[0]["rate"])
+                logger.info(f"Fallback NBU rate: {rate}")
+                return round(rate * (1 + RATE_MARKUP / 100), 4)
     except Exception as e:
-        logger.warning(f"NBU error: {e}")
+        logger.warning(f"NBU fallback error: {e}")
+
     return None
 
 # ── PDF parser ────────────────────────────────────────────────────────────────
@@ -466,7 +521,7 @@ async def handle_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["pending_invoice"]["rate"] = rate
         for item in ctx.user_data["pending_invoice"]["items"]:
             item["rate"] = rate
-        rate_msg = f"💱 Курс НБУ на {date_str}: *{rate:.4f} грн/EUR* (+{RATE_MARKUP}%)"
+        rate_msg = f"💱 Курс міжбанк (Мінфін) на {date_str}: *{rate:.4f} грн/EUR* (+{RATE_MARKUP}%)"
     else:
         ctx.user_data["pending_invoice"]["rate"] = 52.0
         rate_msg = f"⚠️ Не вдалось отримати курс. Використовую 52.00"
