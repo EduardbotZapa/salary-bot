@@ -232,7 +232,7 @@ async def get_nbu_rate(date_str: str):
             m = re_mod.search(r'по курсу межбанка\s+([\d.,]+)', text)
         if not m:
             # Try to find rate in table data
-            m = re_mod.search(r'['"]([\d]{2}[.,][\d]{3,4})['"]', text)
+            m = re_mod.search(r"[0-9]{2}[.,][0-9]{3,4}", text)
 
         if m:
             rate_str = m.group(1).replace(',', '.')
