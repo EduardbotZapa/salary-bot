@@ -34,6 +34,16 @@ DATA_DIR.mkdir(exist_ok=True)
 with open("lookup.json", encoding="utf-8") as f:
     LOOKUP: dict = json.load(f)
 
+# Price list (prais EUR) for stock items
+try:
+    with open("price_lookup.json", encoding="utf-8") as f:
+        PRICE_LOOKUP: dict = json.load(f)
+except:
+    PRICE_LOOKUP: dict = {}
+
+def get_price(art: str) -> float:
+    return PRICE_LOOKUP.get(art, 0)
+
 ORDERS_SHEET_ID = os.environ.get("ORDERS_SHEET_ID", "")
 _live_cache: dict = {}
 _cache_time = None
@@ -145,17 +155,32 @@ def append_to_sheets(manager_name: str, inv: dict):
                 profit = (item["price_uah"] - cost_eur * (1 + duty) * rate) * item["qty"]
             else:
                 profit = revenue - cost_total
+            # Price list & weight logic
+            price_eur = get_price(item["article"])
             weight_unit = lu.get("weight", 0)
-            weight_total = weight_unit * item["qty"] if item.get("is_stock") else 0
+            source = lu.get("source","")
+            is_stock = item.get("is_stock", False)
+
+            # W = виторг - (прайс * курс * кількість)
+            w = round(revenue - price_eur * rate * item["qty"], 2) if (is_stock and price_eur) else 0
+            # S = (виторг - собів.загал) - W
+            s = round((revenue - cost_total) - w, 2) if is_stock else round(profit, 2)
+            # T = W (надбавка менеджера)
+            t = w if is_stock else 0
+
+            # Weight by source
+            weight_china = round(weight_unit * item["qty"], 3) if (is_stock and "китай" in source.lower()) else 0
+            weight_eu    = round(weight_unit * item["qty"], 3) if (is_stock and "e-trade" in source.lower()) else 0
+
             row = [
                 manager_name, inv.get("client",""), inv.get("invoice_num",""),
                 inv.get("date",""), item["article"], item["qty"],
                 round(cost_eur,2), f'{duty*100:.0f}%', round(rate,4),
                 round(cost_unit,2), round(cost_total,2),
-                item["price_uah"], round(revenue,2), round(profit,2),
-                "так" if item.get("is_stock") else "",
-                lu.get("uktved",""), lu.get("brand",""), lu.get("source",""),
-                round(weight_unit,3), round(weight_total,3),
+                item["price_uah"], round(revenue,2), s, t,
+                "так" if is_stock else "",
+                lu.get("uktved",""), lu.get("brand",""), source,
+                price_eur, round(weight_unit,3), weight_china, weight_eu,
                 datetime.now().strftime("%d.%m.%Y %H:%M"),
             ]
             rows_added.append(row)
@@ -264,7 +289,8 @@ def build_excel(manager_name, invoices, month):
     ws.row_dimensions[1].height = 26
 
     headers = ['Клієнт','Рахунок','Дата','Артикул','Кть','Закуп EUR','Мито%',
-               'Курс','Собів UAH','Ціна UAH','Виторг','Собів загал','Прибуток','Склад?','Вага/шт','Вага загал']
+               'Курс','Собів UAH','Ціна UAH','Виторг','Собів загал',
+               'Прибуток S','Надбавка T','Склад?','Прайс EUR','Вага/шт','Вага Китай','Вага Європа']
     ws.row_dimensions[2].height = 36
     for c,h in enumerate(headers,1):
         cell = ws.cell(2,c,h)
@@ -288,12 +314,18 @@ def build_excel(manager_name, invoices, month):
             cost_total = cost_unit*item["qty"]
             profit = (item["price_uah"]-cost_eur*(1+duty)*rate)*item["qty"] if item.get("is_stock") else revenue-cost_total
             is_stock = item.get("is_stock",False)
+            price_eur = get_price(item["article"])
             w_unit = lu.get("weight",0)
-            w_total = round(w_unit*item["qty"],3) if is_stock else 0
+            source = lu.get("source","")
+            wx = round(revenue - price_eur*rate*item["qty"],2) if (is_stock and price_eur) else 0
+            s_val = round((revenue-cost_total)-wx,2) if is_stock else round(profit,2)
+            t_val = wx if is_stock else 0
+            w_china = round(w_unit*item["qty"],3) if (is_stock and "китай" in source.lower()) else 0
+            w_eu    = round(w_unit*item["qty"],3) if (is_stock and "e-trade" in source.lower()) else 0
             vals = [inv.get("client",""),inv.get("invoice_num",""),inv.get("date",""),
                     item["article"],item["qty"],cost_eur,f'{duty*100:.0f}%',rate,
-                    round(cost_unit,2),item["price_uah"],round(revenue,2),round(cost_total,2),round(profit,2),
-                    "так" if is_stock else "",w_unit,w_total]
+                    round(cost_unit,2),item["price_uah"],round(revenue,2),round(cost_total,2),
+                    s_val,t_val,"так" if is_stock else "",price_eur,round(w_unit,3),w_china,w_eu]
             for c,v in enumerate(vals,1):
                 cell = ws.cell(row,c,v)
                 cell.font = Font(name='Arial',size=9)
