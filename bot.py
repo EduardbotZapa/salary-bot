@@ -116,7 +116,7 @@ def get_or_create_ws(spreadsheet, name: str):
         headers = ["Менеджер","Клієнт","Рахунок","Дата оплати","Артикул",
                    "Кть","Закуп EUR","Мито%","Курс","Собів UAH/шт","Собів загал",
                    "Ціна прод UAH","Виторг","Прибуток","Склад?",
-                   "УКТЗЕД","Бренд","Джерело","Додано"]
+                   "УКТЗЕД","Бренд","Джерело","Вага/шт кг","Вага загал кг","Додано"]
         ws.append_row(headers)
         ws.format("A1:S1", {
             "backgroundColor": {"red":0.17,"green":0.18,"blue":0.24},
@@ -142,9 +142,11 @@ def append_to_sheets(manager_name: str, inv: dict):
             cost_total = cost_unit * item["qty"]
             revenue = item["price_uah"] * item["qty"]
             if item.get("is_stock"):
-                profit = (item["price_uah"] - cost_eur * rate) * item["qty"]
+                profit = (item["price_uah"] - cost_eur * (1 + duty) * rate) * item["qty"]
             else:
                 profit = revenue - cost_total
+            weight_unit = lu.get("weight", 0)
+            weight_total = weight_unit * item["qty"] if item.get("is_stock") else 0
             row = [
                 manager_name, inv.get("client",""), inv.get("invoice_num",""),
                 inv.get("date",""), item["article"], item["qty"],
@@ -153,6 +155,7 @@ def append_to_sheets(manager_name: str, inv: dict):
                 item["price_uah"], round(revenue,2), round(profit,2),
                 "так" if item.get("is_stock") else "",
                 lu.get("uktved",""), lu.get("brand",""), lu.get("source",""),
+                round(weight_unit,3), round(weight_total,3),
                 datetime.now().strftime("%d.%m.%Y %H:%M"),
             ]
             rows_added.append(row)
@@ -261,7 +264,7 @@ def build_excel(manager_name, invoices, month):
     ws.row_dimensions[1].height = 26
 
     headers = ['Клієнт','Рахунок','Дата','Артикул','Кть','Закуп EUR','Мито%',
-               'Курс','Собів UAH','Ціна UAH','Виторг','Собів загал','Прибуток','Склад?']
+               'Курс','Собів UAH','Ціна UAH','Виторг','Собів загал','Прибуток','Склад?','Вага/шт','Вага загал']
     ws.row_dimensions[2].height = 36
     for c,h in enumerate(headers,1):
         cell = ws.cell(2,c,h)
@@ -283,12 +286,14 @@ def build_excel(manager_name, invoices, month):
             cost_unit = cost_eur*(1+duty)*rate
             revenue = item["price_uah"]*item["qty"]
             cost_total = cost_unit*item["qty"]
-            profit = (item["price_uah"]-cost_eur*rate)*item["qty"] if item.get("is_stock") else revenue-cost_total
+            profit = (item["price_uah"]-cost_eur*(1+duty)*rate)*item["qty"] if item.get("is_stock") else revenue-cost_total
             is_stock = item.get("is_stock",False)
+            w_unit = lu.get("weight",0)
+            w_total = round(w_unit*item["qty"],3) if is_stock else 0
             vals = [inv.get("client",""),inv.get("invoice_num",""),inv.get("date",""),
                     item["article"],item["qty"],cost_eur,f'{duty*100:.0f}%',rate,
                     round(cost_unit,2),item["price_uah"],round(revenue,2),round(cost_total,2),round(profit,2),
-                    "так" if is_stock else ""]
+                    "так" if is_stock else "",w_unit,w_total]
             for c,v in enumerate(vals,1):
                 cell = ws.cell(row,c,v)
                 cell.font = Font(name='Arial',size=9)
@@ -530,7 +535,7 @@ async def save_invoice(query, ctx: ContextTypes.DEFAULT_TYPE):
         rate = item.get("rate", 52.0)
         cost_uah = cost_eur * (1 + duty) * rate * item["qty"]
         revenue = item["price_uah"] * item["qty"]
-        profit = (item["price_uah"] - cost_eur * rate) * item["qty"] if item.get("is_stock") else revenue - cost_uah
+        profit = (item["price_uah"] - cost_eur * (1 + duty) * rate) * item["qty"] if item.get("is_stock") else revenue - cost_uah
         total_profit += profit
 
     stock_count = len(selected)
@@ -578,7 +583,7 @@ async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             rate = item.get("rate", inv.get("rate",52.0))
             cost_uah = cost_eur*(1+duty)*rate*item["qty"]
             revenue = item["price_uah"]*item["qty"]
-            profit = (item["price_uah"]-cost_eur*rate)*item["qty"] if item.get("is_stock") else revenue-cost_uah
+            profit = (item["price_uah"]-cost_eur*(1+duty)*rate)*item["qty"] if item.get("is_stock") else revenue-cost_uah
             total_profit += profit
             total_revenue += revenue
 
@@ -638,7 +643,7 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     rate = item.get("rate",52.0)
                     cost_uah = cost_eur*(1+duty)*rate*item["qty"]
                     revenue = item["price_uah"]*item["qty"]
-                    p = (item["price_uah"]-cost_eur*rate)*item["qty"] if item.get("is_stock") else revenue-cost_uah
+                    p = (item["price_uah"]-cost_eur*(1+duty)*rate)*item["qty"] if item.get("is_stock") else revenue-cost_uah
                     profit += p
             salary = max(0,profit)*SALARY_PCT/100
             lines.append(f"👤 *{name}*: {len(invoices)} рахунків\n   Прибуток: {profit:,.0f} грн | ЗП: {salary:,.0f} грн\n")
