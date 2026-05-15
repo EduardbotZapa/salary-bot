@@ -434,54 +434,117 @@ async def handle_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["pending_invoice"]["rate"] = 52.0
         rate_msg = f"⚠️ Не вдалось отримати курс. Використовую 52.00"
 
+    inv = ctx.user_data.get("pending_invoice", {})
+    items = inv.get("items", [])
+    ctx.user_data["stock_selected"] = set()
+    await update.message.reply_text(rate_msg, parse_mode="Markdown")
     await update.message.reply_text(
-        rate_msg + "\n\nЄ складські товари? Введи артикули через кому або /no",
+        "📦 *Вибери складські товари* (натисни щоб відмітити):",
+        reply_markup=build_stock_keyboard(items, set()),
         parse_mode="Markdown"
     )
     return WAIT_STOCK
 
+def build_stock_keyboard(items: list, selected: set) -> InlineKeyboardMarkup:
+    """Build keyboard with checkboxes for each item."""
+    buttons = []
+    for item in items:
+        art = item["article"]
+        qty = item["qty"]
+        check = "✅" if art in selected else "☐"
+        buttons.append([InlineKeyboardButton(
+            f"{check} {art} × {qty}",
+            callback_data=f"stock_{art}"
+        )])
+    buttons.append([
+        InlineKeyboardButton("✅ Готово — немає складських", callback_data="stock_done_none"),
+        InlineKeyboardButton("💾 Зберегти", callback_data="stock_done"),
+    ])
+    return InlineKeyboardMarkup(buttons)
+
 async def handle_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
     inv = ctx.user_data.get("pending_invoice", {})
+    items = inv.get("items", [])
+    ctx.user_data["stock_selected"] = set()
 
-    if text.lower() not in ["/no","no","ні","нет"]:
-        stock_arts = [a.strip() for a in text.replace("/","").split(",")]
-        for item in inv.get("items",[]):
-            if item["article"] in stock_arts:
-                item["is_stock"] = True
+    await update.message.reply_text(
+        "📦 *Вибери складські товари* (натисни щоб відмітити):",
+        reply_markup=build_stock_keyboard(items, set()),
+        parse_mode="Markdown"
+    )
+    return WAIT_STOCK
 
-    uid = update.effective_user.id
+async def callback_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "stock_done_none":
+        # No stock items
+        ctx.user_data["stock_selected"] = set()
+        await save_invoice(query, ctx)
+        return ConversationHandler.END
+
+    if query.data == "stock_done":
+        await save_invoice(query, ctx)
+        return ConversationHandler.END
+
+    if query.data.startswith("stock_"):
+        art = query.data[6:]
+        selected = ctx.user_data.get("stock_selected", set())
+        if art in selected:
+            selected.discard(art)
+        else:
+            selected.add(art)
+        ctx.user_data["stock_selected"] = selected
+
+        inv = ctx.user_data.get("pending_invoice", {})
+        await query.edit_message_reply_markup(
+            reply_markup=build_stock_keyboard(inv.get("items", []), selected)
+        )
+
+async def save_invoice(query, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = query.from_user.id
     user = load_user(uid)
-    user.setdefault("invoices",[]).append(inv)
+    inv = ctx.user_data.get("pending_invoice", {})
+    selected = ctx.user_data.get("stock_selected", set())
+
+    # Mark stock items
+    for item in inv.get("items", []):
+        item["is_stock"] = item["article"] in selected
+
+    user.setdefault("invoices", []).append(inv)
     save_user(uid, user)
 
-    # Save to Google Sheets
     manager_name = user.get("name", str(uid))
     sheet_ok = append_to_sheets(manager_name, inv)
     sheet_msg = "📊 Записано в Google Sheets ✓" if sheet_ok else "⚠️ Google Sheets недоступний"
 
     ctx.user_data.pop("pending_invoice", None)
+    ctx.user_data.pop("stock_selected", None)
 
     total_profit = 0
-    for item in inv.get("items",[]):
+    for item in inv.get("items", []):
         lu = lookup_article(item["article"])
-        cost_eur = lu.get("cost_eur",0)
-        duty = lu.get("duty",0.04)
-        rate = item.get("rate",52.0)
-        cost_uah = cost_eur*(1+duty)*rate*item["qty"]
-        revenue = item["price_uah"]*item["qty"]
-        profit = (item["price_uah"]-cost_eur*rate)*item["qty"] if item.get("is_stock") else revenue-cost_uah
+        cost_eur = lu.get("cost_eur", 0)
+        duty = lu.get("duty", 0.04)
+        rate = item.get("rate", 52.0)
+        cost_uah = cost_eur * (1 + duty) * rate * item["qty"]
+        revenue = item["price_uah"] * item["qty"]
+        profit = (item["price_uah"] - cost_eur * rate) * item["qty"] if item.get("is_stock") else revenue - cost_uah
         total_profit += profit
 
-    await update.message.reply_text(
+    stock_count = len(selected)
+    stock_msg = f"🔴 Складських: {stock_count}" if stock_count else "🟢 Складських немає"
+
+    await query.edit_message_text(
         f"✅ *Рахунок збережено!*\n\n"
         f"💰 Прибуток: *{total_profit:,.0f} грн*\n"
-        f"📁 Рахунків цього місяця: {len(user.get('invoices',[]))}\n"
+        f"{stock_msg}\n"
+        f"📁 Рахунків цього місяця: {len(user.get('invoices', []))}\n"
         f"{sheet_msg}\n\n"
         f"Надішли наступний PDF або /report для Excel.",
         parse_mode="Markdown"
     )
-    return ConversationHandler.END
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -605,8 +668,7 @@ def main():
         states={
             WAIT_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, set_name)],
             WAIT_DATE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date)],
-            WAIT_STOCK:    [MessageHandler(filters.TEXT, handle_stock),
-                            CommandHandler("no", handle_stock)],
+            WAIT_STOCK:    [MessageHandler(filters.TEXT, handle_stock)],
             WAIT_DELIVERY: [MessageHandler(filters.TEXT, handle_delivery),
                             CommandHandler("0", handle_delivery)],
         },
@@ -614,6 +676,7 @@ def main():
         allow_reentry=True,
     )
     app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(callback_stock, pattern="^stock_"))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("sheet", cmd_sheet))
