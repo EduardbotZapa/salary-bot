@@ -822,17 +822,23 @@ async def handle_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def build_stock_keyboard(items: list, selected: set) -> InlineKeyboardMarkup:
     """Build keyboard with checkboxes for each item."""
     buttons = []
-    for item in items:
+    for i, item in enumerate(items):
         art = item["article"]
         qty = item["qty"]
-        check = "✅" if art in selected else "☐"
+        check = "🔴" if art in selected else "⚪"
+        # Use index instead of article name to keep callback_data short
         buttons.append([InlineKeyboardButton(
             f"{check} {art} × {qty}",
-            callback_data=f"stock_{art}"
+            callback_data=f"stk_{i}"
         )])
+    # Action buttons
+    all_selected = len(selected) == len(items) and len(items) > 0
     buttons.append([
-        InlineKeyboardButton("✅ Готово — немає складських", callback_data="stock_done_none"),
-        InlineKeyboardButton("💾 Зберегти", callback_data="stock_done"),
+        InlineKeyboardButton("🔴 Все склад" if not all_selected else "⚪ Зняти все",
+                             callback_data="stk_all"),
+    ])
+    buttons.append([
+        InlineKeyboardButton("✅ Зберегти", callback_data="stk_save"),
     ])
     return InlineKeyboardMarkup(buttons)
 
@@ -851,30 +857,41 @@ async def handle_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def callback_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    inv = ctx.user_data.get("pending_invoice", {})
+    items = inv.get("items", [])
+    selected = ctx.user_data.get("stock_selected", set())
 
-    if query.data == "stock_done_none":
-        # No stock items
-        ctx.user_data["stock_selected"] = set()
+    if query.data == "stk_save":
         await save_invoice(query, ctx)
         return ConversationHandler.END
 
-    if query.data == "stock_done":
-        await save_invoice(query, ctx)
-        return ConversationHandler.END
-
-    if query.data.startswith("stock_"):
-        art = query.data[6:]
-        selected = ctx.user_data.get("stock_selected", set())
-        if art in selected:
-            selected.discard(art)
+    if query.data == "stk_all":
+        # Toggle all
+        all_articles = {item["article"] for item in items}
+        if selected == all_articles:
+            selected = set()
         else:
-            selected.add(art)
+            selected = all_articles
         ctx.user_data["stock_selected"] = selected
-
-        inv = ctx.user_data.get("pending_invoice", {})
         await query.edit_message_reply_markup(
-            reply_markup=build_stock_keyboard(inv.get("items", []), selected)
+            reply_markup=build_stock_keyboard(items, selected)
         )
+        return WAIT_STOCK
+
+    if query.data.startswith("stk_"):
+        try:
+            idx = int(query.data[4:])
+            if 0 <= idx < len(items):
+                art = items[idx]["article"]
+                if art in selected:
+                    selected.discard(art)
+                else:
+                    selected.add(art)
+                ctx.user_data["stock_selected"] = selected
+                await query.edit_message_reply_markup(
+                    reply_markup=build_stock_keyboard(items, selected)
+                )
+        except: pass
 
 async def save_invoice(query, ctx: ContextTypes.DEFAULT_TYPE):
     uid = query.from_user.id
@@ -1303,7 +1320,7 @@ def main():
             WAIT_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, set_name)],
             WAIT_DATE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date)],
             WAIT_STOCK:    [
-                CallbackQueryHandler(callback_stock, pattern="^stock_"),
+                CallbackQueryHandler(callback_stock, pattern="^stk_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stock),
             ],
             WAIT_DELIVERY: [MessageHandler(filters.TEXT, handle_delivery),
