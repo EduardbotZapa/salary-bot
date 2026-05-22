@@ -322,58 +322,72 @@ def save_user(uid, data):
 
 # ── Minfin interbank rate ─────────────────────────────────────────────────────
 async def get_nbu_rate(date_str: str):
-    """Get EUR interbank buy rate from minfin.com.ua + markup %"""
+    """Get EUR interbank BUY rate from minfin.com.ua + markup %"""
+    import re as re_rate
     try:
         dt = datetime.strptime(date_str, "%d.%m.%Y")
-        # minfin archive URL format: /currency/mb/eur/YYYY-MM-DD/
-        url = f"https://minfin.com.ua/currency/mb/eur/{dt.day:02d}-{dt.month:02d}-{dt.year}/"
+
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "uk,ru;q=0.9",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "uk-UA,uk;q=0.9,ru;q=0.8",
+            "Referer": "https://minfin.com.ua/currency/mb/",
         }
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            r = await client.get(url, headers=headers)
+
+        # ── Method 1: Minfin EUR archive page ────────────────────────────────
+        # URL: /currency/mb/eur/DD-MM-YYYY/
+        page_url = f"https://minfin.com.ua/currency/mb/eur/{dt.day:02d}-{dt.month:02d}-{dt.year}/"
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+            r = await client.get(page_url, headers=headers)
             text = r.text
 
-        # Find buy rate in page - pattern: "можна було купити ... по курсу межбанка X"
-        import re as re_mod
-        # Try JSON data embedded in page
-        m = re_mod.search(r'"buy"\s*:\s*"?([\d.]+)"?', text)
-        if not m:
-            # Try alternative pattern from page text
-            m = re_mod.search(r'по курсу межбанка\s+([\d.,]+)', text)
-        if not m:
-            # Try to find rate in table data
-            m = re_mod.search(r"[0-9]{2}[.,][0-9]{3,4}", text)
-
+        # Look for: "по курсу межбанка 51,4287"
+        m = re_rate.search(r"по курсу межбанка\s+([\d]+[,.][\d]+)", text)
         if m:
-            rate_str = m.group(1).replace(',', '.')
-            rate = float(rate_str)
-            if 30 < rate < 200:  # sanity check
+            rate = float(m.group(1).replace(",", "."))
+            if 48 < rate < 65:  # EUR/UAH realistic range
                 final = round(rate * (1 + RATE_MARKUP / 100), 2)
-                logger.info(f"Minfin rate {date_str}: {rate} + {RATE_MARKUP}% = {final}")
+                logger.info(f"Minfin EUR buy {date_str}: {rate} -> {final}")
                 return final
 
-        # Fallback: try minfin API endpoint
-        api_url = f"https://minfin.com.ua/api/currency/mb/?currency=eur&date={dt:%Y-%m-%d}"
-        async with httpx.AsyncClient(timeout=8) as client:
-            r2 = await client.get(api_url, headers=headers)
-            if r2.status_code == 200:
-                data = r2.json()
-                if isinstance(data, list) and data:
-                    rate = float(data[0].get("buy", 0) or data[0].get("rate", 0))
-                    if rate > 0:
-                        return round(rate * (1 + RATE_MARKUP / 100), 2)
-                elif isinstance(data, dict):
-                    rate = float(data.get("buy", 0) or data.get("rate", 0))
-                    if rate > 0:
-                        return round(rate * (1 + RATE_MARKUP / 100), 2)
+        # Look for JSON in __NEXT_DATA__ or similar script tags
+        # Pattern: "buy":"51.4287" near "eur" context
+        eur_section = text.lower()
+        eur_pos = eur_section.find('"eur"')
+        if eur_pos == -1:
+            eur_pos = eur_section.find("euro")
+        if eur_pos > 0:
+            chunk = text[max(0, eur_pos-200):eur_pos+500]
+            m = re_rate.search(r'"buy"\s*:\s*"?([\d.]+)"?', chunk)
+            if m:
+                rate = float(m.group(1))
+                if 48 < rate < 65:
+                    final = round(rate * (1 + RATE_MARKUP / 100), 2)
+                    logger.info(f"Minfin JSON EUR buy {date_str}: {rate} -> {final}")
+                    return final
+
+        # ── Method 2: search all "buy" values, pick EUR range ────────────────
+        all_buys = re_rate.findall(r'"buy"\s*:\s*"?([\d.]+)"?', text)
+        for b in all_buys:
+            rate = float(b)
+            if 48 < rate < 65:  # EUR range
+                final = round(rate * (1 + RATE_MARKUP / 100), 2)
+                logger.info(f"Minfin all-buy EUR {date_str}: {rate} -> {final}")
+                return final
+
+        # ── Method 3: find any number in EUR range on EUR page ───────────────
+        all_nums = re_rate.findall(r"5[0-9][,.][\d]{4}", text)
+        if all_nums:
+            rate = float(all_nums[0].replace(",", "."))
+            if 48 < rate < 65:
+                final = round(rate * (1 + RATE_MARKUP / 100), 2)
+                logger.info(f"Minfin num EUR {date_str}: {rate} -> {final}")
+                return final
 
     except Exception as e:
         logger.warning(f"Minfin rate error: {e}")
 
-    # Final fallback: NBU
+    # ── Fallback: NBU official rate ───────────────────────────────────────────
     try:
         dt = datetime.strptime(date_str, "%d.%m.%Y")
         url = f"https://bank.gov.ua/NBU_Exchange/exchange_site?start={dt:%Y%m%d}&end={dt:%Y%m%d}&valcode=EUR&sort=exchangedate&order=desc&json"
@@ -382,12 +396,13 @@ async def get_nbu_rate(date_str: str):
             data = r.json()
             if data:
                 rate = float(data[0]["rate"])
-                logger.info(f"Fallback NBU rate: {rate}")
+                logger.info(f"NBU fallback EUR {date_str}: {rate}")
                 return round(rate * (1 + RATE_MARKUP / 100), 2)
     except Exception as e:
         logger.warning(f"NBU fallback error: {e}")
 
     return None
+
 
 # ── PDF parser ────────────────────────────────────────────────────────────────
 def parse_pdf(path: str) -> dict:
