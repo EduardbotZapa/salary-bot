@@ -48,6 +48,17 @@ try:
 except:
     INVOICE_LOOKUP: dict = {}
 
+# Currency rates archive: "DD.MM.YYYY" -> buy rate
+try:
+    with open("rates.json", encoding="utf-8") as f:
+        RATES: dict = json.load(f)
+except:
+    RATES: dict = {}
+
+def get_rate_from_archive(date_str: str) -> float:
+    """Get EUR buy rate from local archive, return 0 if not found"""
+    return float(RATES.get(date_str, 0))
+
 def get_price(art: str) -> float:
     return PRICE_LOOKUP.get(art, 0)
 
@@ -320,10 +331,18 @@ def load_user(uid):
 def save_user(uid, data):
     _uf(uid).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-# ── Minfin interbank rate ─────────────────────────────────────────────────────
+# ── Currency rate (archive first, then Minfin, then NBU) ─────────────────────
 async def get_nbu_rate(date_str: str):
-    """Get EUR interbank BUY rate from minfin.com.ua + markup %"""
+    """Get EUR buy rate: archive -> Minfin -> NBU fallback"""
     import re as re_rate
+
+    # ── Method 0: Local rates archive (most accurate) ─────────────────────────
+    archived = get_rate_from_archive(date_str)
+    if archived > 0:
+        final = round(archived * (1 + RATE_MARKUP / 100), 2)
+        logger.info(f"Archive rate {date_str}: {archived} -> {final}")
+        return final
+
     try:
         dt = datetime.strptime(date_str, "%d.%m.%Y")
 
@@ -575,7 +594,7 @@ def build_excel(manager_name, invoices, month):
     return path
 
 # ── States ────────────────────────────────────────────────────────────────────
-WAIT_NAME, WAIT_DATE, WAIT_STOCK, WAIT_DELIVERY, WAIT_EXCEL = range(5)
+WAIT_NAME, WAIT_DATE, WAIT_STOCK, WAIT_DELIVERY, WAIT_EXCEL, WAIT_RATES = range(6)
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -589,7 +608,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/report — Excel з ЗП за місяць\n"
             "/clear — очистити місяць\n"
             "/name — змінити ім'я"
-            + ("\n/admin — всі менеджери\n/update — оновити довідник" if update.effective_user.id in ADMIN_IDS else "")
+            + ("\n/admin — всі менеджери\n/update — оновити довідник\n/rates — оновити курси валют" if update.effective_user.id in ADMIN_IDS else "")
         )
     else:
         await update.message.reply_text("👋 Привіт! Як тебе звати? (введи ім'я)")
@@ -940,6 +959,78 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     return WAIT_EXCEL
 
+async def cmd_rates(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin only: update currency rates from Excel file"""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Немає доступу.")
+        return
+    await update.message.reply_text(
+        "📂 Надішли Excel файл з курсами валют (.xlsx)\n"
+        "Формат: колонка *Дата* і *Курс покупки* (або аналогічна структура)",
+        parse_mode="Markdown"
+    )
+    return WAIT_RATES
+
+async def handle_rates_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Process uploaded rates Excel"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return ConversationHandler.END
+
+    doc = update.message.document
+    if not doc.file_name.endswith(".xlsx"):
+        await update.message.reply_text("❌ Потрібен .xlsx файл")
+        return WAIT_RATES
+
+    msg = await update.message.reply_text("⏳ Оновлюю курси...")
+    try:
+        import pandas as pd
+
+        file = await ctx.bot.get_file(doc.file_id)
+        xlsx_path = str(DATA_DIR / f"rates_{doc.file_id}.xlsx")
+        await file.download_to_drive(xlsx_path)
+
+        xl = pd.ExcelFile(xlsx_path)
+        df = pd.read_excel(xl, sheet_name=0, header=1)
+        df.columns = [str(c).strip() for c in df.columns]
+        import os as os_mod
+        os_mod.remove(xlsx_path)
+
+        # Find date and buy columns
+        date_col = next((c for c in df.columns if 'дат' in c.lower() or 'date' in c.lower()), df.columns[0])
+        # Accept both buy/sell column names - just take the rate column (2nd column)
+        buy_col = next(
+            (c for c in df.columns if 'покуп' in c.lower() or 'buy' in c.lower() or 'курс' in c.lower()),
+            df.columns[1]
+        )
+
+        rates_new = {}
+        for _, row in df.iterrows():
+            try:
+                d = row[date_col]
+                if pd.isna(d): continue
+                date_str = d.strftime("%d.%m.%Y") if hasattr(d, "strftime") else str(d)[:10]
+                buy = float(str(row[buy_col]).replace(",", "."))
+                if buy > 0:
+                    rates_new[date_str] = buy
+            except: pass
+
+        with open("rates.json", "w", encoding="utf-8") as f:
+            json.dump(rates_new, f, ensure_ascii=False, indent=2)
+
+        RATES.clear()
+        RATES.update(rates_new)
+
+        await msg.edit_text(
+            f"✅ *Курси оновлено!*\n\n"
+            f"📅 Дат: *{len(rates_new)}*\n"
+            f"📆 Від {min(rates_new.keys())} до {max(rates_new.keys())}",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await msg.edit_text(f"❌ Помилка: {e}")
+
+    return ConversationHandler.END
+
 async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Process uploaded Excel and rebuild lookup.json"""
     if update.effective_user.id not in ADMIN_IDS:
@@ -1068,6 +1159,7 @@ def main():
             CommandHandler("report", cmd_report),
             CommandHandler("name", cmd_name),
             CommandHandler("update", cmd_update),
+            CommandHandler("rates", cmd_rates),
         ],
         states={
             WAIT_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, set_name)],
@@ -1077,6 +1169,9 @@ def main():
             ],
             WAIT_DELIVERY: [MessageHandler(filters.TEXT, handle_delivery),
                             CommandHandler("0", handle_delivery)],
+            WAIT_RATES: [MessageHandler(filters.Document.MimeType(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ), handle_rates_update)],
             WAIT_EXCEL: [MessageHandler(filters.Document.MimeType(
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             ), handle_excel_update)],
@@ -1086,6 +1181,7 @@ def main():
     )
     app.add_handler(conv)
     app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("rates", cmd_rates))
     app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("sheet", cmd_sheet))
