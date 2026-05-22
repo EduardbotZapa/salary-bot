@@ -308,8 +308,8 @@ def append_to_sheets(manager_name: str, inv: dict):
                 source,                                          # S Джерело
                 round(price_eur, 2) if price_eur else "",        # T Прайс EUR
                 round(weight_unit, 3) if weight_unit else "",    # U Вага/шт
-                f'=IF(AND(P{r}="так",S{r}="Китай"),U{r}*F{r},0)',  # V
-                f'=IF(AND(P{r}="так",S{r}="E-Trade Automation"),U{r}*F{r},0)', # W
+                f'=IF(AND($P{r}="так",$S{r}="Китай"),$U{r}*$F{r},0)',  # V
+                f'=IF(AND($P{r}="так",$S{r}="E-Trade Automation"),$U{r}*$F{r},0)', # W
                 datetime.now().strftime("%d.%m.%Y %H:%M"),       # X
             ]
             rows_to_write.append(row)
