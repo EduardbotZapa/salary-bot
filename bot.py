@@ -742,12 +742,12 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"📄 *{parsed['invoice_num']}*", f"👤 {parsed['client']}", ""]
     for item in parsed["items"]:
+        # Use same fallback chain as save logic
         lu = lookup_article(item["article"], inv_number)
+        if not lu.get("cost_eur"):
+            lu = lookup_article(item["article"], inv_number, is_stock=True)
         cost = f"{lu['cost_eur']:.2f} EUR" if lu.get("cost_eur") else "❓ немає в довіднику"
         lines.append(f"• `{item['article']}` × {item['qty']} — {item['price_uah']:,.2f} грн | Закуп: {cost}")
-
-    if not_found:
-        lines.append(f"\n⚠️ Не знайдено ({len(not_found)}): {', '.join(not_found[:5])}")
 
     lines.append(f"\n✅ Знайдено: {len(found)}/{len(parsed['items'])}")
     if not_found:
