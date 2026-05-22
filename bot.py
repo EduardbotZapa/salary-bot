@@ -722,7 +722,11 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     found, not_found = [], []
     for item in parsed["items"]:
+        # Try with invoice match AND stock fallback (assume might be stock)
         lu = lookup_article(item["article"], inv_number)
+        if not lu.get("cost_eur"):
+            # Try as stock item (checks stock_lookup)
+            lu = lookup_article(item["article"], inv_number, is_stock=True)
         if lu.get("cost_eur"):
             item.update(lu)
             found.append(item["article"])
@@ -738,7 +742,7 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"📄 *{parsed['invoice_num']}*", f"👤 {parsed['client']}", ""]
     for item in parsed["items"]:
-        lu = lookup_article(item["article"])
+        lu = lookup_article(item["article"], inv_number)
         cost = f"{lu['cost_eur']:.2f} EUR" if lu.get("cost_eur") else "❓ немає в довіднику"
         lines.append(f"• `{item['article']}` × {item['qty']} — {item['price_uah']:,.2f} грн | Закуп: {cost}")
 
