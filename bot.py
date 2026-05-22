@@ -1108,7 +1108,7 @@ async def handle_rates_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Process uploaded Excel and rebuild lookup.json"""
+    """Process uploaded Excel and rebuild all 3 lookup files"""
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Немає доступу.")
         return ConversationHandler.END
@@ -1118,10 +1118,12 @@ async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Потрібен .xlsx файл")
         return WAIT_EXCEL
 
-    msg = await update.message.reply_text("⏳ Оновлюю довідник...")
+    msg = await update.message.reply_text("⏳ Оновлюю довідники (lookup + invoice + stock)...")
 
     try:
         import pandas as pd
+        import re as re_up
+        from datetime import datetime as dt_up
 
         file = await ctx.bot.get_file(doc.file_id)
         xlsx_path = str(DATA_DIR / f"orders_{doc.file_id}.xlsx")
@@ -1129,95 +1131,155 @@ async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         xl = pd.ExcelFile(xlsx_path)
         sheets = xl.sheet_names
-        
-        dfs = []
+
+        import os as os_mod
+
+        # Sheet-specific invoice column names
+        invoice_col_names = {
+            'E-Trade Automation': '№ Рахунку',
+            'Китай': 'Рахунок Україна',
+        }
+
+        new_lookup = {}
+        new_invoice_lookup = {}
+        new_stock_lookup = {}
+
         for sheet in sheets:
             try:
                 df = pd.read_excel(xl, sheet_name=sheet, header=0)
-                df['_src'] = sheet
-                dfs.append(df)
             except Exception as e:
                 logger.warning(f"Sheet {sheet} error: {e}")
+                continue
 
-        if not dfs:
-            await msg.edit_text("❌ Не вдалось прочитати аркуші")
-            return ConversationHandler.END
-
-        import os as os_mod
-        os_mod.remove(xlsx_path)
-
-        # Find article and price columns automatically
-        lookup = {}
-        total = 0
-        for df in dfs:
-            src = df['_src'].iloc[0] if '_src' in df.columns else ''
-            cols = [str(c).strip().lower() for c in df.columns]
-            
+            cols = list(df.columns)
             def find_col(keywords):
                 for kw in keywords:
                     for i, c in enumerate(cols):
-                        if kw in c: return i
+                        if kw.lower() in str(c).lower(): return i
                 return -1
 
-            art_i     = find_col(['артикул'])
-            price_i   = find_col(['ціна за одиницю', 'price'])
-            uktved_i  = find_col(['код товару', 'уктзед'])
-            duty_i    = find_col(['мито'])
-            weight_i  = find_col(['нетто за 1', 'вага', 'weight'])
-            brand_i   = find_col(['виробник', 'brand'])
+            art_i = find_col(['артикул'])
+            price_i = find_col(['ціна за одиницю', 'price'])
+            uktved_i = find_col(['код товару', 'уктзед'])
+            duty_i = find_col(['мито'])
+            weight_i = find_col(['нетто за 1', 'вага'])
+            brand_i = find_col(['виробник', 'brand'])
+            date_i = find_col(['дата підтвердження'])
+            inv_col_name = invoice_col_names.get(sheet, '№ Рахунку')
+            invoice_i = find_col([inv_col_name])
 
-            if art_i < 0:
-                continue
+            if art_i < 0: continue
 
             for _, row in df.iterrows():
                 art = str(row.iloc[art_i]).strip()
-                if not art or art == 'nan' or art == 'Артикул':
-                    continue
+                if not art or art in ('nan', 'Артикул', ''): continue
+
                 try:
-                    price = float(str(row.iloc[price_i]).replace(',','.').replace(' ','')) if price_i >= 0 else 0
+                    raw_price = str(row.iloc[price_i]) if price_i >= 0 else "0"
+                    cleaned = re_up.sub(r"[^\d.,\-]", "", raw_price).replace(",", ".")
+                    price = float(cleaned) if cleaned else 0
                 except: price = 0
+
                 try:
-                    duty = float(str(row.iloc[duty_i]).replace(',','.').replace(' ','').replace('%','')) if duty_i >= 0 else 0.04
+                    duty = float(str(row.iloc[duty_i]).replace(",",".").replace(" ","").replace("%","")) if duty_i >= 0 else 0.04
                     if duty > 1: duty = duty / 100
                 except: duty = 0.04
-                try:
-                    weight = float(str(row.iloc[weight_i]).replace(',','.').replace(' ','')) if weight_i >= 0 else 0
+                try: weight = float(str(row.iloc[weight_i]).replace(",",".").replace(" ","")) if weight_i >= 0 else 0
                 except: weight = 0
-                try:
-                    brand = str(row.iloc[brand_i]).strip() if brand_i >= 0 else ''
+                try: brand = str(row.iloc[brand_i]).strip() if brand_i >= 0 else ''
                 except: brand = ''
+                brand = '' if brand == 'nan' else brand
 
-                lookup[art] = {
+                date_str = ''
+                date_obj = None
+                if date_i >= 0:
+                    try:
+                        d = row.iloc[date_i]
+                        if pd.notna(d) and hasattr(d, 'strftime'):
+                            date_str = d.strftime('%d.%m.%Y')
+                            date_obj = d
+                    except: pass
+
+                inv_raw = str(row.iloc[invoice_i]).strip() if invoice_i >= 0 else ''
+                is_storage = 'склад' in inv_raw.lower()
+                inv_num = ''
+                if not is_storage:
+                    m = re_up.search(r'№\s*(\d+)', inv_raw)
+                    if m: inv_num = m.group(1)
+
+                record = {
                     'uktved': str(row.iloc[uktved_i]).strip() if uktved_i >= 0 and uktved_i < len(row) else '',
                     'duty': duty,
                     'cost_eur': price,
                     'weight': weight,
-                    'brand': brand if brand != 'nan' else '',
-                    'source': src,
+                    'brand': brand,
+                    'source': sheet,
+                    'confirm_date': date_str,
+                    'invoice_num': inv_num,
+                    'is_storage': is_storage,
                 }
-                total += 1
 
-        # Save new lookup.json
+                # Stock lookup
+                if is_storage and price > 0:
+                    existing = new_stock_lookup.get(art)
+                    if not existing:
+                        new_stock_lookup[art] = record
+                    else:
+                        try:
+                            ex_date = dt_up.strptime(existing['confirm_date'], '%d.%m.%Y') if existing.get('confirm_date') else dt_up.min
+                            new_date = date_obj.to_pydatetime() if hasattr(date_obj, 'to_pydatetime') else (date_obj if date_obj else dt_up.min)
+                            if new_date > ex_date:
+                                new_stock_lookup[art] = record
+                        except:
+                            new_stock_lookup[art] = record
+
+                # Invoice lookup
+                if inv_num:
+                    key = f"{inv_num}:{art}"
+                    if key not in new_invoice_lookup or (price > 0 and new_invoice_lookup[key].get('cost_eur', 0) == 0):
+                        new_invoice_lookup[key] = record
+
+                # General lookup
+                existing = new_lookup.get(art, {})
+                if price > 0 or not existing:
+                    record_copy = dict(record)
+                    if price == 0 and existing.get('cost_eur', 0) > 0:
+                        record_copy['cost_eur'] = existing['cost_eur']
+                    new_lookup[art] = record_copy
+
+        os_mod.remove(xlsx_path)
+
+        # Save all 3 files
         import json as json_mod
         with open('lookup.json', 'w', encoding='utf-8') as f:
-            json_mod.dump(lookup, f, ensure_ascii=False, indent=2)
+            json_mod.dump(new_lookup, f, ensure_ascii=False, indent=2)
+        with open('invoice_lookup.json', 'w', encoding='utf-8') as f:
+            json_mod.dump(new_invoice_lookup, f, ensure_ascii=False, indent=2)
+        with open('stock_lookup.json', 'w', encoding='utf-8') as f:
+            json_mod.dump(new_stock_lookup, f, ensure_ascii=False, indent=2)
 
-        # Also update in-memory LOOKUP
-        LOOKUP.clear()
-        LOOKUP.update(lookup)
+        # Update in-memory
+        LOOKUP.clear(); LOOKUP.update(new_lookup)
+        INVOICE_LOOKUP.clear(); INVOICE_LOOKUP.update(new_invoice_lookup)
+        STOCK_LOOKUP.clear(); STOCK_LOOKUP.update(new_stock_lookup)
 
         await msg.edit_text(
-            f"✅ *Довідник оновлено!*\n\n"
-            f"📦 Артикулів: *{len(lookup)}*\n"
-            f"📋 Аркушів: {len(dfs)} ({', '.join(sheets[:3])})",
+            f"✅ *Довідники оновлено!*\n\n"
+            f"📦 Артикулів: *{len(new_lookup)}*\n"
+            f"📄 По рахунках: *{len(new_invoice_lookup)}*\n"
+            f"📦 Склад: *{len(new_stock_lookup)}*\n"
+            f"📋 Аркушів: {len(sheets)} ({', '.join(sheets[:3])})",
             parse_mode="Markdown"
         )
 
     except Exception as e:
         logger.error(f"Excel update error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         await msg.edit_text(f"❌ Помилка: {e}")
 
     return ConversationHandler.END
+
 
 async def cmd_sheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if SHEET_ID:
