@@ -105,6 +105,9 @@ _cache_time = None
 
 def refresh_live_lookup():
     global _live_cache, _cache_time
+    # Skip entirely if not configured - we use static lookup.json instead
+    if not ORDERS_SHEET_ID:
+        return
     import time
     now = time.time()
     # Refresh every 30 minutes
@@ -161,16 +164,29 @@ def refresh_live_lookup():
         logger.error(f"Live lookup error: {e}")
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
+# Cache gspread client to avoid re-auth on every call
+_gsheet_cache = None
+_gsheet_time = 0
+
 def get_gsheet():
+    global _gsheet_cache, _gsheet_time
+    import time
+    now = time.time()
+    # Cache for 30 min - tokens last 1 hour
+    if _gsheet_cache and now - _gsheet_time < 1800:
+        return _gsheet_cache
     try:
         creds_dict = json.loads(GOOGLE_CREDS)
         scopes = ["https://spreadsheets.google.com/feeds",
                   "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         gc = gspread.authorize(creds)
-        return gc.open_by_key(SHEET_ID)
+        _gsheet_cache = gc.open_by_key(SHEET_ID)
+        _gsheet_time = now
+        return _gsheet_cache
     except Exception as e:
         logger.error(f"GSheet connect error: {e}")
+        _gsheet_cache = None
         return None
 
 def get_or_create_ws(spreadsheet, name: str):
@@ -285,8 +301,8 @@ def append_to_sheets(manager_name: str, inv: dict):
                 source,                                          # S Джерело
                 round(price_eur, 2) if price_eur else "",        # T Прайс EUR
                 round(weight_unit, 3) if weight_unit else "",    # U Вага/шт
-                f'=IF(P{r}="так",IF(REGEXMATCH(LOWER(S{r}),"китай"),U{r}*F{r},0),0)',  # V
-                f'=IF(P{r}="так",IF(REGEXMATCH(LOWER(S{r}),"e-trade"),U{r}*F{r},0),0)', # W
+                f'=IFERROR(IF(AND(P{r}="так",ISNUMBER(SEARCH("итай",S{r}))),U{r}*F{r},0),0)',  # V
+                f'=IFERROR(IF(AND(P{r}="так",ISNUMBER(SEARCH("rade",S{r}))),U{r}*F{r},0),0)', # W
                 datetime.now().strftime("%d.%m.%Y %H:%M"),       # X
             ]
             rows_to_write.append(row)
@@ -306,24 +322,38 @@ def append_to_sheets(manager_name: str, inv: dict):
             value_input_option="USER_ENTERED"
         )
 
-        # ── Number formatting (batch) ─────────────────────────────────────────
+        # ── ALL formatting in ONE batch_update call (massive speedup) ─────
+        batch_formats = []
+
+        # Number formatting for data rows
         num_format = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}
-        # Only data rows (skip separator and header)
         data_start = first_row + (2 if existing and len(existing) > 1 else 1)
         if data_start <= last_row:
             for col in ["G", "H", "I", "J", "K", "L", "M", "N", "O", "T", "U", "V", "W"]:
-                ws_mgr.format(f"{col}{data_start}:{col}{last_row}", num_format)
+                batch_formats.append({"range": f"{col}{data_start}:{col}{last_row}", "format": num_format})
 
-        # ── Color stock article cells ─────────────────────────────────────────
+        # Stock article cells - red
+        stock_fmt = {
+            "backgroundColor": {"red": 0.99, "green": 0.87, "blue": 0.87},
+            "textFormat": {"bold": True, "foregroundColor": {"red": 0.8, "green": 0.0, "blue": 0.0}}
+        }
         for sr in stock_rows:
-            ws_mgr.format(f"E{sr}", {
-                "backgroundColor": {"red": 0.99, "green": 0.87, "blue": 0.87},
-                "textFormat": {"bold": True, "foregroundColor": {"red": 0.8, "green": 0.0, "blue": 0.0}}
-            })
+            batch_formats.append({"range": f"E{sr}", "format": stock_fmt})
 
-        # ── Apply separator/header formatting ─────────────────────────────────
-        for req in format_requests:
-            ws_mgr.format(req["range"], req["format"])
+        # Separator/header rows
+        batch_formats.extend(format_requests)
+
+        # Apply ALL formats in ONE API call
+        if batch_formats:
+            try:
+                ws_mgr.batch_format(batch_formats)
+            except Exception as e:
+                # Fallback to individual format calls if batch_format unsupported
+                logger.warning(f"batch_format failed, fallback: {e}")
+                for bf in batch_formats:
+                    try:
+                        ws_mgr.format(bf["range"], bf["format"])
+                    except: pass
 
         # ── Append to ВСІ sheet (single batch) ────────────────────────────────
         try:
