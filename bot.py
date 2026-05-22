@@ -189,36 +189,30 @@ def append_to_sheets(manager_name: str, inv: dict):
         date = inv.get("date", "")
         items = inv.get("items", [])
 
-        # ── Build all rows to write at once ──────────────────────────────────
-        # Step 1: count current rows to know starting index
+        # Step 1: get current row count
         existing = ws_mgr.get_all_values()
-        start_row = len(existing) + 1
+        cur = len(existing) + 1  # next empty row
 
-        all_rows_data = []   # plain values for batch append
-        format_tasks = []    # (range, format_dict)
-        formula_updates = [] # (range, [[formula]])
-
-        cur_row = start_row
-
-        # Separator row (if not first invoice)
-        if len(existing) > 1:
-            all_rows_data.append([""] * 24)
-            format_tasks.append((f"A{cur_row}:X{cur_row}", {
+        # Step 2: separator row (pastel blue) if not first entry
+        if cur > 2:
+            ws_mgr.update(f"A{cur}:X{cur}", [[""]*24])
+            ws_mgr.format(f"A{cur}:X{cur}", {
                 "backgroundColor": {"red": 0.85, "green": 0.91, "blue": 0.97}
-            }))
-            cur_row += 1
+            })
+            ws_all.append_row([""]*24)
+            cur += 1
 
-        # Invoice header row
-        title = [manager_name, client, invoice_num, date] + [""] * 20
-        all_rows_data.append(title)
-        format_tasks.append((f"A{cur_row}:X{cur_row}", {
+        # Step 3: invoice header row (bold, light blue) - only once
+        header = [manager_name, client, invoice_num, date] + [""]*20
+        ws_mgr.update(f"A{cur}:X{cur}", [header])
+        ws_mgr.format(f"A{cur}:X{cur}", {
             "backgroundColor": {"red": 0.78, "green": 0.87, "blue": 0.95},
             "textFormat": {"bold": True}
-        }))
-        cur_row += 1
+        })
+        ws_all.append_row(header)
+        cur += 1
 
-        # Item rows
-        item_rows = []
+        # Step 4: one row per item with formulas
         for item in items:
             lu = lookup_article(item["article"])
             cost_eur = lu.get("cost_eur", 0)
@@ -228,26 +222,14 @@ def append_to_sheets(manager_name: str, inv: dict):
             source = lu.get("source", "")
             is_stock = item.get("is_stock", False)
             duty_pct = round(duty * 100, 1)
-            r = cur_row
+            r = cur
 
-            # Plain row first (for batch insert)
-            plain_row = [
-                manager_name, client, invoice_num, date,
-                item["article"], item["qty"],
-                round(cost_eur, 2), duty_pct, round(rate, 2),
-                "", "",  # J, K - will be formula
-                item["price_uah"], "",  # L, M
-                "", "",  # N, O
-                "так" if is_stock else "",
-                lu.get("uktved", ""), lu.get("brand", ""), source,
-                round(price_eur, 2) if price_eur else "",
-                round(weight_unit, 3) if weight_unit else "",
-                "", "",  # V, W
-                datetime.now().strftime("%d.%m.%Y %H:%M"),
-            ]
-            all_rows_data.append(plain_row)
+            # Build row: columns A..X (24 cols)
+            # A=Менеджер B=Клієнт C=Рахунок D=Дата E=Артикул F=Кть
+            # G=Закуп EUR H=Мито% I=Курс J=Собів UAH/шт K=Собів загал
+            # L=Ціна прод UAH M=Виторг N=Прибуток(S) O=Надбавка(T) P=Склад?
+            # Q=УКТЗЕД R=Бренд S=Джерело T=Прайс EUR U=Вага/шт V=Вага Китай W=Вага Євро X=Додано
 
-            # Formulas to apply after insert
             if is_stock:
                 fn = f"=M{r}-T{r}*I{r}*F{r}"
                 fo = f"=(M{r}-K{r})-N{r}"
@@ -255,43 +237,69 @@ def append_to_sheets(manager_name: str, inv: dict):
                 fn = f"=M{r}-K{r}"
                 fo = "=0"
 
-            formula_updates.append((f"J{r}", f"=G{r}*(1+H{r}/100)*I{r}"))
-            formula_updates.append((f"K{r}", f"=J{r}*F{r}"))
-            formula_updates.append((f"M{r}", f"=L{r}*F{r}"))
-            formula_updates.append((f"N{r}", fn))
-            formula_updates.append((f"O{r}", fo))
-            formula_updates.append((f"V{r}", f'=IF(P{r}="так",IF(REGEXMATCH(LOWER(S{r}),"китай"),U{r}*F{r},0),0)'))
-            formula_updates.append((f"W{r}", f'=IF(P{r}="так",IF(REGEXMATCH(LOWER(S{r}),"e-trade"),U{r}*F{r},0),0)'))
+            row = [
+                manager_name,                                    # A
+                client,                                          # B
+                invoice_num,                                     # C
+                date,                                            # D
+                item["article"],                                 # E
+                item["qty"],                                     # F
+                round(cost_eur, 2),                             # G
+                duty_pct,                                        # H
+                round(rate, 2),                                  # I
+                f"=G{r}*(1+H{r}/100)*I{r}",                    # J Собів UAH/шт
+                f"=J{r}*F{r}",                                  # K Собів загал
+                item["price_uah"],                               # L Ціна прод
+                f"=L{r}*F{r}",                                  # M Виторг
+                fn,                                              # N Прибуток S
+                fo,                                              # O Надбавка T
+                "так" if is_stock else "",                       # P Склад?
+                lu.get("uktved", ""),                           # Q УКТЗЕД
+                lu.get("brand", ""),                            # R Бренд
+                source,                                          # S Джерело
+                round(price_eur, 2) if price_eur else "",       # T Прайс EUR
+                round(weight_unit, 3) if weight_unit else "",   # U Вага/шт
+                f'=IF(P{r}="так",IF(REGEXMATCH(LOWER(S{r}),"китай"),U{r}*F{r},0),0)',  # V Вага Китай
+                f'=IF(P{r}="так",IF(REGEXMATCH(LOWER(S{r}),"e-trade"),U{r}*F{r},0),0)', # W Вага Євро
+                datetime.now().strftime("%d.%m.%Y %H:%M"),      # X Додано
+            ]
 
+            # Write row with formulas
+            ws_mgr.update(f"A{r}:X{r}", [row], value_input_option="USER_ENTERED")
+
+            # Color stock rows red
             if is_stock:
-                format_tasks.append((f"A{r}:X{r}", {
+                ws_mgr.format(f"A{r}:X{r}", {
                     "backgroundColor": {"red": 0.99, "green": 0.87, "blue": 0.87}
-                }))
+                })
 
-            item_rows.append((r, plain_row, is_stock))
-            cur_row += 1
+            # Write plain values to ВСІ
+            plain = [
+                manager_name, client, invoice_num, date,
+                item["article"], item["qty"],
+                round(cost_eur, 2), duty_pct, round(rate, 2),
+                round(cost_eur*(1+duty)*rate, 2),
+                round(cost_eur*(1+duty)*rate*item["qty"], 2),
+                item["price_uah"],
+                round(item["price_uah"]*item["qty"], 2),
+                round((item["price_uah"] - (price_eur or cost_eur*(1+duty))*rate)*item["qty"], 2) if is_stock else round(item["price_uah"]*item["qty"] - cost_eur*(1+duty)*rate*item["qty"], 2),
+                round(item["price_uah"]*item["qty"] - cost_eur*(1+duty)*rate*item["qty"] - (item["price_uah"] - (price_eur or cost_eur*(1+duty))*rate)*item["qty"], 2) if is_stock else 0,
+                "так" if is_stock else "",
+                lu.get("uktved", ""), lu.get("brand", ""), source,
+                round(price_eur, 2) if price_eur else "",
+                round(weight_unit, 3) if weight_unit else "",
+                "", "",
+                datetime.now().strftime("%d.%m.%Y %H:%M"),
+            ]
+            ws_all.append_row(plain, value_input_option="USER_ENTERED")
 
-        # ── Step 2: Batch insert all rows at once ─────────────────────────────
-        ws_mgr.append_rows(all_rows_data, value_input_option="USER_ENTERED")
-
-        # ── Step 3: Apply formulas ────────────────────────────────────────────
-        for cell_addr, formula in formula_updates:
-            ws_mgr.update(cell_addr, formula, value_input_option="USER_ENTERED")
-
-        # ── Step 4: Apply formatting ──────────────────────────────────────────
-        for range_str, fmt in format_tasks:
-            ws_mgr.format(range_str, fmt)
-
-        # ── Step 5: Write to ВСІ sheet (values only, fast) ───────────────────
-        all_plain = []
-        for row_data in all_rows_data:
-            all_plain.append(row_data)
-        ws_all.append_rows(all_plain, value_input_option="USER_ENTERED")
+            cur += 1
 
         return True
     except Exception as e:
         logger.error(f"Sheet append error: {e}")
         return False
+
 
 # ── Storage ───────────────────────────────────────────────────────────────────
 def _uf(uid): return DATA_DIR / f"{uid}.json"
