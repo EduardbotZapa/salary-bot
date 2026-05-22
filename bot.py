@@ -48,6 +48,13 @@ try:
 except:
     INVOICE_LOOKUP: dict = {}
 
+# Storage-only lookup: article -> latest stock record with price
+try:
+    with open("stock_lookup.json", encoding="utf-8") as f:
+        STOCK_LOOKUP: dict = json.load(f)
+except:
+    STOCK_LOOKUP: dict = {}
+
 # Currency rates archive: "DD.MM.YYYY" -> buy rate
 try:
     with open("rates.json", encoding="utf-8") as f:
@@ -262,7 +269,7 @@ def append_to_sheets(manager_name: str, inv: dict):
         # Item rows with formulas
         stock_rows = []  # rows to color red on E column
         for item in items:
-            lu = lookup_article(item["article"], inv_number)
+            lu = lookup_article(item["article"], inv_number, item.get("is_stock", False))
             cost_eur = lu.get("cost_eur", 0)
             duty = lu.get("duty", 0.04)
             price_eur = get_price(item["article"])
@@ -514,24 +521,42 @@ def parse_pdf(path: str) -> dict:
             except: pass
     return result
 
-def lookup_article(art: str, invoice_num: str = "") -> dict:
+def lookup_article(art: str, invoice_num: str = "", is_stock: bool = False) -> dict:
+    """Find article record.
+    For stock items: 1) invoice-specific 2) stock_lookup (latest "Склад" record) 3) any
+    For non-stock: 1) invoice-specific 2) latest with price
+    """
     art = art.strip()
-    # Try invoice-specific lookup first (most accurate)
-    if invoice_num:
+
+    # Priority 1: Invoice-specific record (for non-stock items)
+    if invoice_num and not is_stock:
         inv_key = f"{invoice_num}:{art}"
         if inv_key in INVOICE_LOOKUP:
             rec = INVOICE_LOOKUP[inv_key]
             if rec.get("cost_eur", 0) > 0:
                 return rec
-    # Try live cache
+
+    # Priority 2 (stock): use stock_lookup (latest "Склад" purchase)
+    if is_stock:
+        if art in STOCK_LOOKUP:
+            rec = STOCK_LOOKUP[art]
+            if rec.get("cost_eur", 0) > 0:
+                return rec
+        # Even for stock, check invoice match first
+        if invoice_num:
+            inv_key = f"{invoice_num}:{art}"
+            if inv_key in INVOICE_LOOKUP:
+                rec = INVOICE_LOOKUP[inv_key]
+                if rec.get("cost_eur", 0) > 0:
+                    return rec
+
+    # Fallback: live cache or general lookup
     if ORDERS_SHEET_ID and _live_cache:
         result = _live_cache.get(art)
         if result:
             return result
-    # Exact match in static lookup
     if art in LOOKUP:
         return LOOKUP[art]
-    # Normalized match (handle extra spaces)
     art_norm = " ".join(art.upper().split())
     for key, val in LOOKUP.items():
         if " ".join(key.upper().split()) == art_norm:
@@ -570,7 +595,7 @@ def build_excel(manager_name, invoices, month):
     row = 3
     for inv in invoices:
         for item in inv.get("items",[]):
-            lu = lookup_article(item["article"], inv_number)
+            lu = lookup_article(item["article"], inv_number, item.get("is_stock", False))
             cost_eur = lu.get("cost_eur",0)
             duty = lu.get("duty",0.04)
             rate = item.get("rate", inv.get("rate",52.0))
@@ -921,7 +946,7 @@ async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     total_revenue = 0
     for inv in invoices:
         for item in inv.get("items",[]):
-            lu = lookup_article(item["article"], inv_number)
+            lu = lookup_article(item["article"], inv_number, item.get("is_stock", False))
             cost_eur = lu.get("cost_eur",0)
             duty = lu.get("duty",0.04)
             rate = item.get("rate", inv.get("rate",52.0))
@@ -981,7 +1006,7 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             profit = 0
             for inv in invoices:
                 for item in inv.get("items",[]):
-                    lu = lookup_article(item["article"], inv_number)
+                    lu = lookup_article(item["article"], inv_number, item.get("is_stock", False))
                     cost_eur = lu.get("cost_eur",0)
                     duty = lu.get("duty",0.04)
                     rate = item.get("rate",52.0)
