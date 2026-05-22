@@ -44,6 +44,43 @@ except:
 def get_price(art: str) -> float:
     return PRICE_LOOKUP.get(art, 0)
 
+def shorten_company(name: str) -> str:
+    """Convert full legal name to short abbreviation + name"""
+    if not name:
+        return name
+    name = name.strip()
+    
+    replacements = [
+        # Full forms -> abbreviations
+        ('ТОВАРИСТВО З ОБМЕЖЕНОЮ ВІДПОВІДАЛЬНІСТЮ', 'ТОВ'),
+        ('Товариство з обмеженою відповідальністю', 'ТОВ'),
+        ('АКЦІОНЕРНЕ ТОВАРИСТВО', 'АТ'),
+        ('Акціонерне товариство', 'АТ'),
+        ('ПУБЛІЧНЕ АКЦІОНЕРНЕ ТОВАРИСТВО', 'ПАТ'),
+        ('ПРИВАТНЕ АКЦІОНЕРНЕ ТОВАРИСТВО', 'ПРАТ'),
+        ('ФІЗИЧНА ОСОБА ПІДПРИЄМЕЦЬ', 'ФОП'),
+        ('Фізична особа підприємець', 'ФОП'),
+        ('ФІЗИЧНА ОСОБА-ПІДПРИЄМЕЦЬ', 'ФОП'),
+        ('Фізична особа-підприємець', 'ФОП'),
+        ('ДЕРЖАВНЕ ПІДПРИЄМСТВО', 'ДП'),
+        ('КОМУНАЛЬНЕ ПІДПРИЄМСТВО', 'КП'),
+        ('ПРИВАТНЕ ПІДПРИЄМСТВО', 'ПП'),
+        ('Приватне підприємство', 'ПП'),
+    ]
+    
+    for full, short in replacements:
+        if full in name:
+            name = name.replace(full, short).strip()
+            break
+    
+    # Remove quotes around company name
+    import re as re_co
+    name = re_co.sub(r'[\u0022\u201c\u201d\u00ab\u00bb\u2018\u2019]', '', name).strip()
+    # Remove extra spaces
+    name = ' '.join(name.split())
+    
+    return name
+
 ORDERS_SHEET_ID = os.environ.get("ORDERS_SHEET_ID", "")
 _live_cache: dict = {}
 _cache_time = None
@@ -124,9 +161,12 @@ def get_or_create_ws(spreadsheet, name: str):
     except gspread.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=name, rows=500, cols=20)
         headers = ["Менеджер","Клієнт","Рахунок","Дата оплати","Артикул",
-                   "Кть","Закуп EUR","Мито%","Курс","Собів UAH/шт","Собів загал",
-                   "Ціна прод UAH","Виторг","Прибуток","Склад?",
-                   "УКТЗЕД","Бренд","Джерело","Вага/шт кг","Вага загал кг","Додано"]
+                   "Кть","Закуп EUR","Мито%","Курс",
+                   "Собів UAH/шт","Собів загал",
+                   "Ціна прод UAH","Виторг",
+                   "Прибуток (S)","Надбавка (T)","Склад?",
+                   "УКТЗЕД","Бренд","Джерело",
+                   "Прайс EUR","Вага/шт","Вага Китай","Вага Європа","Додано"]
         ws.append_row(headers)
         ws.format("A1:S1", {
             "backgroundColor": {"red":0.17,"green":0.18,"blue":0.24},
@@ -142,58 +182,136 @@ def append_to_sheets(manager_name: str, inv: dict):
             return False
         ws_mgr = get_or_create_ws(sh, manager_name)
         ws_all = get_or_create_ws(sh, "ВСІ")
-        rows_added = []
+
+        rate = inv.get("rate", 52.0)
+        client = inv.get("client", "")
+        invoice_num = inv.get("invoice_num", "")
+        date = inv.get("date", "")
+
+        # ── Separator + invoice header ────────────────────────────────────────
+        all_vals = ws_mgr.get_all_values()
+        if len(all_vals) > 1:
+            # Pastel blue separator row
+            ws_mgr.append_row([""] * 24)
+            ws_all.append_row([""] * 24)
+            sep_idx = len(ws_mgr.get_all_values())
+            ws_mgr.format(f"A{sep_idx}:X{sep_idx}", {
+                "backgroundColor": {"red": 0.85, "green": 0.91, "blue": 0.97}
+            })
+
+        # Invoice title row (bold, light blue)
+        title = [manager_name, client, invoice_num, date] + [""] * 20
+        ws_mgr.append_row(title)
+        ws_all.append_row(title)
+        title_idx = len(ws_mgr.get_all_values())
+        ws_mgr.format(f"A{title_idx}:X{title_idx}", {
+            "backgroundColor": {"red": 0.78, "green": 0.87, "blue": 0.95},
+            "textFormat": {"bold": True}
+        })
+
+        # ── Data rows with formulas ───────────────────────────────────────────
         for item in inv.get("items", []):
             lu = lookup_article(item["article"])
             cost_eur = lu.get("cost_eur", 0)
             duty = lu.get("duty", 0.04)
-            rate = item.get("rate", inv.get("rate", 52.0))
-            cost_unit = cost_eur * (1 + duty) * rate
-            cost_total = cost_unit * item["qty"]
-            revenue = item["price_uah"] * item["qty"]
-            if item.get("is_stock"):
-                profit = (item["price_uah"] - cost_eur * (1 + duty) * rate) * item["qty"]
-            else:
-                profit = revenue - cost_total
-            # Price list & weight logic
             price_eur = get_price(item["article"])
             weight_unit = lu.get("weight", 0)
-            source = lu.get("source","")
+            source = lu.get("source", "")
             is_stock = item.get("is_stock", False)
+            duty_pct = duty * 100  # e.g. 4.0
 
-            # W = різниця з прайсом = надбавка менеджера
-            w = round(revenue - price_eur * rate * item["qty"], 2) if (is_stock and price_eur) else 0
-            # S = W = надбавка менеджера понад прайс (колонка Прибуток-%)
-            s = w if is_stock else round(profit, 2)
-            # T = (виторг - собів.загал) - W = прибуток від прайсової частини
-            t = round((revenue - cost_total) - w, 2) if is_stock else 0
+            # Append row first to get row index
+            placeholder = [""] * 24
+            ws_mgr.append_row(placeholder)
+            ws_all.append_row(placeholder)
+            r_idx = len(ws_mgr.get_all_values())
 
-            # Weight by source
-            weight_china = round(weight_unit * item["qty"], 3) if (is_stock and "китай" in source.lower()) else 0
-            weight_eu    = round(weight_unit * item["qty"], 3) if (is_stock and "e-trade" in source.lower()) else 0
+            # Column letters
+            # A=Менеджер B=Клієнт C=Рахунок D=Дата E=Артикул F=Кть
+            # G=Закуп EUR H=Мито% I=Курс J=Собів UAH/шт K=Собів загал
+            # L=Ціна прод UAH M=Виторг N=Прибуток(S) O=Надбавка(T) P=Склад?
+            # Q=УКТЗЕД R=Бренд S=Джерело T=Прайс EUR U=Вага/шт V=Вага Китай W=Вага Євро X=Додано
 
-            row = [
-                manager_name, inv.get("client",""), inv.get("invoice_num",""),
-                inv.get("date",""), item["article"], item["qty"],
-                round(cost_eur,2), f'{duty*100:.0f}%', round(rate,4),
-                round(cost_unit,2), round(cost_total,2),
-                item["price_uah"], round(revenue,2), s, t,
+            # Formulas:
+            # J = Собів UAH/шт = G*(1+H/100)*I
+            # K = Собів загал  = J*F
+            # M = Виторг       = L*F
+            # N = Прибуток S:
+            #   if stock: = M - T*I*F   (виторг - прайс*курс*кть)
+            #   else:     = M - K       (виторг - собів загал)
+            # O = Надбавка T:
+            #   if stock: = (M-K) - N   (повний прибуток - S)
+            #   else:     = 0
+            # V = Вага Китай = if(P="так", if(S="Китай", U*F, 0), 0)
+            # W = Вага Євро  = if(P="так", if(S="E-Trade Automation", U*F, 0), 0)
+
+            if is_stock:
+                formula_n = f'=M{r_idx}-T{r_idx}*I{r_idx}*F{r_idx}'
+                formula_o = f'=(M{r_idx}-K{r_idx})-N{r_idx}'
+            else:
+                formula_n = f'=M{r_idx}-K{r_idx}'
+                formula_o = f'=0'
+
+            cells = {
+                f'A{r_idx}': manager_name,
+                f'B{r_idx}': client,
+                f'C{r_idx}': invoice_num,
+                f'D{r_idx}': date,
+                f'E{r_idx}': item["article"],
+                f'F{r_idx}': item["qty"],
+                f'G{r_idx}': round(cost_eur, 2),
+                f'H{r_idx}': round(duty_pct, 1),
+                f'I{r_idx}': round(rate, 2),
+                f'J{r_idx}': f'=G{r_idx}*(1+H{r_idx}/100)*I{r_idx}',
+                f'K{r_idx}': f'=J{r_idx}*F{r_idx}',
+                f'L{r_idx}': item["price_uah"],
+                f'M{r_idx}': f'=L{r_idx}*F{r_idx}',
+                f'N{r_idx}': formula_n,
+                f'O{r_idx}': formula_o,
+                f'P{r_idx}': "так" if is_stock else "",
+                f'Q{r_idx}': lu.get("uktved", ""),
+                f'R{r_idx}': lu.get("brand", ""),
+                f'S{r_idx}': source,
+                f'T{r_idx}': round(price_eur, 2) if price_eur else "",
+                f'U{r_idx}': round(weight_unit, 3) if weight_unit else "",
+                f'V{r_idx}': f'=IF(P{r_idx}="так",IF(REGEXMATCH(LOWER(S{r_idx}),"китай"),U{r_idx}*F{r_idx},0),0)',
+                f'W{r_idx}': f'=IF(P{r_idx}="так",IF(REGEXMATCH(LOWER(S{r_idx}),"e-trade"),U{r_idx}*F{r_idx},0),0)',
+                f'X{r_idx}': datetime.now().strftime("%d.%m.%Y %H:%M"),
+            }
+
+            # Batch update all cells
+            cell_list = []
+            for cell_addr, val in cells.items():
+                cell_list.append(gspread.Cell.from_address(cell_addr, val))
+            ws_mgr.update_cells(cell_list, value_input_option="USER_ENTERED")
+
+            # Color stock rows red
+            if is_stock:
+                ws_mgr.format(f"A{r_idx}:X{r_idx}", {
+                    "backgroundColor": {"red": 0.99, "green": 0.87, "blue": 0.87}
+                })
+
+            # Also append to ВСІ sheet (as values for speed)
+            vals_all = [
+                manager_name, client, invoice_num, date,
+                item["article"], item["qty"],
+                round(cost_eur,2), round(duty_pct,1), round(rate,2),
+                round(cost_eur*(1+duty)*rate,2), round(cost_eur*(1+duty)*rate*item["qty"],2),
+                item["price_uah"], round(item["price_uah"]*item["qty"],2),
+                round(item["price_uah"]*item["qty"] - cost_eur*(1+duty)*rate*item["qty"] if not is_stock else item["price_uah"]*item["qty"] - (price_eur or 0)*rate*item["qty"], 2),
+                0 if not is_stock else round(item["price_uah"]*item["qty"] - cost_eur*(1+duty)*rate*item["qty"] - (item["price_uah"]*item["qty"] - (price_eur or 0)*rate*item["qty"]), 2),
                 "так" if is_stock else "",
                 lu.get("uktved",""), lu.get("brand",""), source,
-                price_eur, round(weight_unit,3), weight_china, weight_eu,
+                round(price_eur,2) if price_eur else "",
+                round(weight_unit,3) if weight_unit else "",
+                "", "",
                 datetime.now().strftime("%d.%m.%Y %H:%M"),
             ]
-            rows_added.append(row)
-            ws_mgr.append_row(row)
-            ws_all.append_row(row)
+            # Update the placeholder row in ВСІ
+            all_vals_all = ws_all.get_all_values()
+            all_r = len(all_vals_all)
+            ws_all.update(f"A{all_r}:X{all_r}", [vals_all], value_input_option="USER_ENTERED")
 
-        # Color red stock rows
-        all_vals = ws_mgr.get_all_values()
-        for i, r in enumerate(all_vals[1:], 2):
-            if len(r) >= 15 and r[14] == "так":
-                ws_mgr.format(f"A{i}:S{i}", {
-                    "backgroundColor": {"red":0.99,"green":0.87,"blue":0.87}
-                })
         return True
     except Exception as e:
         logger.error(f"Sheet append error: {e}")
@@ -213,7 +331,7 @@ async def get_nbu_rate(date_str: str):
     try:
         dt = datetime.strptime(date_str, "%d.%m.%Y")
         # minfin archive URL format: /currency/mb/eur/YYYY-MM-DD/
-        url = f"https://minfin.com.ua/currency/mb/eur/{dt:%Y-%m-%d}/"
+        url = f"https://minfin.com.ua/currency/mb/eur/{dt.day:02d}-{dt.month:02d}-{dt.year}/"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "text/html,application/xhtml+xml",
@@ -238,7 +356,7 @@ async def get_nbu_rate(date_str: str):
             rate_str = m.group(1).replace(',', '.')
             rate = float(rate_str)
             if 30 < rate < 200:  # sanity check
-                final = round(rate * (1 + RATE_MARKUP / 100), 4)
+                final = round(rate * (1 + RATE_MARKUP / 100), 2)
                 logger.info(f"Minfin rate {date_str}: {rate} + {RATE_MARKUP}% = {final}")
                 return final
 
@@ -251,11 +369,11 @@ async def get_nbu_rate(date_str: str):
                 if isinstance(data, list) and data:
                     rate = float(data[0].get("buy", 0) or data[0].get("rate", 0))
                     if rate > 0:
-                        return round(rate * (1 + RATE_MARKUP / 100), 4)
+                        return round(rate * (1 + RATE_MARKUP / 100), 2)
                 elif isinstance(data, dict):
                     rate = float(data.get("buy", 0) or data.get("rate", 0))
                     if rate > 0:
-                        return round(rate * (1 + RATE_MARKUP / 100), 4)
+                        return round(rate * (1 + RATE_MARKUP / 100), 2)
 
     except Exception as e:
         logger.warning(f"Minfin rate error: {e}")
@@ -270,7 +388,7 @@ async def get_nbu_rate(date_str: str):
             if data:
                 rate = float(data[0]["rate"])
                 logger.info(f"Fallback NBU rate: {rate}")
-                return round(rate * (1 + RATE_MARKUP / 100), 4)
+                return round(rate * (1 + RATE_MARKUP / 100), 2)
     except Exception as e:
         logger.warning(f"NBU fallback error: {e}")
 
@@ -299,7 +417,7 @@ def parse_pdf(path: str) -> dict:
 
     m2 = re.search(r"Покупець:\s*(.+?)(?:\n|Тел)", text, re.DOTALL)
     if m2:
-        result["client"] = m2.group(1).strip()[:80]
+        result["client"] = shorten_company(m2.group(1).strip()[:120])
 
     item_pat = re.compile(
         r"\d{1,3}\s+[\w\s,\-\'\.]+?([A-Z0-9][A-Z0-9\-\/\.]{4,})\s+(\d+)\s+шт\s+([\d\s]+[,.][\d]{2})\s+([\d\s]+[,.][\d]{2})"
@@ -521,7 +639,7 @@ async def handle_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["pending_invoice"]["rate"] = rate
         for item in ctx.user_data["pending_invoice"]["items"]:
             item["rate"] = rate
-        rate_msg = f"💱 Курс міжбанк (Мінфін) на {date_str}: *{rate:.4f} грн/EUR* (+{RATE_MARKUP}%)"
+        rate_msg = f"💱 Курс міжбанк (Мінфін) на {date_str}: *{rate:.2f} грн/EUR* (+{RATE_MARKUP}%)"
     else:
         ctx.user_data["pending_invoice"]["rate"] = 52.0
         rate_msg = f"⚠️ Не вдалось отримати курс. Використовую 52.00"
