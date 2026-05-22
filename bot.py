@@ -622,10 +622,45 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"\n⚠️ Не знайдено ({len(not_found)}): {', '.join(not_found[:5])}")
 
     lines.append(f"\n✅ Знайдено: {len(found)}/{len(parsed['items'])}")
-    lines.append("\nВведи дату оплати (ДД.ММ.РРРР):")
+    if not_found:
+        lines.append(f"⚠️ Не знайдено ({len(not_found)}): {', '.join(not_found)}")
 
+    # Auto-get date from lookup (Дата підтвердження замовлення)
+    # Use date from first found item, or today
+    auto_date = ""
+    for item in parsed["items"]:
+        lu = lookup_article(item["article"])
+        d = lu.get("confirm_date", "")
+        if d:
+            auto_date = d
+            break
+
+    if not auto_date:
+        auto_date = datetime.now().strftime("%d.%m.%Y")
+
+    ctx.user_data["pending_invoice"]["date"] = auto_date
+
+    # Auto-fetch rate for that date
+    rate = await get_nbu_rate(auto_date)
+    if rate:
+        ctx.user_data["pending_invoice"]["rate"] = rate
+        for item in ctx.user_data["pending_invoice"]["items"]:
+            item["rate"] = rate
+        lines.append(f"\n💱 Дата: *{auto_date}* | Курс: *{rate:.2f} грн/EUR* (+{RATE_MARKUP}%)")
+    else:
+        ctx.user_data["pending_invoice"]["rate"] = 52.0
+        lines.append(f"\n💱 Дата: *{auto_date}* | ⚠️ Курс не знайдено, використовую 52.00")
+
+    # Show stock keyboard
+    items = ctx.user_data["pending_invoice"].get("items", [])
+    ctx.user_data["stock_selected"] = set()
     await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-    return WAIT_DATE
+    await msg.reply_text(
+        "📦 *Вибери складські товари* (натисни щоб відмітити):",
+        reply_markup=build_stock_keyboard(items, set()),
+        parse_mode="Markdown"
+    )
+    return WAIT_STOCK
 
 async def handle_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     date_str = update.message.text.strip()
@@ -1002,7 +1037,6 @@ def main():
         ],
         states={
             WAIT_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, set_name)],
-            WAIT_DATE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date)],
             WAIT_STOCK:    [
                 CallbackQueryHandler(callback_stock, pattern="^stock_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stock),
