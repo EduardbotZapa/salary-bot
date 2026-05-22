@@ -295,6 +295,16 @@ def append_to_sheets(manager_name: str, inv: dict):
                     "textFormat": {"bold": True, "foregroundColor": {"red": 0.8, "green": 0.0, "blue": 0.0}}
                 })
 
+            # Format numeric columns to 2 decimal places
+            # G=Закуп EUR, H=Мито%, I=Курс, J=Собів/шт, K=Собів загал
+            # L=Ціна прод, M=Виторг, N=Прибуток S, O=Надбавка T, T=Прайс EUR
+            # U=Вага/шт, V=Вага Китай, W=Вага Євро
+            num_fmt = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}
+            for col_letter in ["G", "I", "J", "K", "L", "M", "N", "O", "T", "U", "V", "W"]:
+                ws_mgr.format(f"{col_letter}{r}", num_fmt)
+            # Мито% - integer
+            ws_mgr.format(f"H{r}", {"numberFormat": {"type": "NUMBER", "pattern": "0.00"}})
+
             # Write plain values to ВСІ
             plain = [
                 manager_name, client, invoice_num, date,
