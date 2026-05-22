@@ -194,6 +194,7 @@ def get_or_create_ws(spreadsheet, name: str):
         return ws
 
 def append_to_sheets(manager_name: str, inv: dict):
+    """Write invoice to Google Sheets using BATCH updates for speed."""
     try:
         sh = get_gsheet()
         if not sh:
@@ -201,39 +202,49 @@ def append_to_sheets(manager_name: str, inv: dict):
         ws_mgr = get_or_create_ws(sh, manager_name)
         ws_all = get_or_create_ws(sh, "ВСІ")
 
-        rate = inv.get("rate", 52.0)
+        rate = inv.get("rate", 0)
         client = inv.get("client", "")
         invoice_num = inv.get("invoice_num", "")
         date = inv.get("date", "")
         items = inv.get("items", [])
         import re as re_sh
-        m_sh = re_sh.search(r'[№#No]+\s*(\d+)', invoice_num)
+        m_sh = re_sh.search(r"[№#No]+\s*(\d+)", invoice_num)
         inv_number = m_sh.group(1) if m_sh else ""
 
-        # Step 1: get current row count
+        # Get current row count
         existing = ws_mgr.get_all_values()
-        cur = len(existing) + 1  # next empty row
+        start_row = len(existing) + 1
 
-        # Step 2: separator row (pastel blue) if not first entry
-        if cur > 2:
-            ws_mgr.update(f"A{cur}:X{cur}", [[""]*24])
-            ws_mgr.format(f"A{cur}:X{cur}", {
-                "backgroundColor": {"red": 0.85, "green": 0.91, "blue": 0.97}
+        # Build ALL rows in memory first
+        rows_to_write = []
+        format_requests = []
+        all_sheet_rows = []  # for ВСІ
+
+        # Separator row (if not first entry)
+        if start_row > 2:
+            rows_to_write.append([""] * 24)
+            format_requests.append({
+                "range": f"A{start_row}:X{start_row}",
+                "format": {"backgroundColor": {"red": 0.85, "green": 0.91, "blue": 0.97}}
             })
-            ws_all.append_row([""]*24)
-            cur += 1
+            all_sheet_rows.append([""] * 24)
+            start_row += 1
 
-        # Step 3: invoice header row (bold, light blue) - only once
-        header = [manager_name, client, invoice_num, date] + [""]*20
-        ws_mgr.update(f"A{cur}:X{cur}", [header])
-        ws_mgr.format(f"A{cur}:X{cur}", {
-            "backgroundColor": {"red": 0.78, "green": 0.87, "blue": 0.95},
-            "textFormat": {"bold": True}
+        # Invoice header row
+        header = [manager_name, client, invoice_num, date] + [""] * 20
+        rows_to_write.append(header)
+        format_requests.append({
+            "range": f"A{start_row}:X{start_row}",
+            "format": {
+                "backgroundColor": {"red": 0.78, "green": 0.87, "blue": 0.95},
+                "textFormat": {"bold": True}
+            }
         })
-        ws_all.append_row(header)
-        cur += 1
+        all_sheet_rows.append(header)
+        start_row += 1
 
-        # Step 4: one row per item with formulas
+        # Item rows with formulas
+        stock_rows = []  # rows to color red on E column
         for item in items:
             lu = lookup_article(item["article"], inv_number)
             cost_eur = lu.get("cost_eur", 0)
@@ -243,13 +254,7 @@ def append_to_sheets(manager_name: str, inv: dict):
             source = lu.get("source", "")
             is_stock = item.get("is_stock", False)
             duty_pct = round(duty * 100, 1)
-            r = cur
-
-            # Build row: columns A..X (24 cols)
-            # A=Менеджер B=Клієнт C=Рахунок D=Дата E=Артикул F=Кть
-            # G=Закуп EUR H=Мито% I=Курс J=Собів UAH/шт K=Собів загал
-            # L=Ціна прод UAH M=Виторг N=Прибуток(S) O=Надбавка(T) P=Склад?
-            # Q=УКТЗЕД R=Бренд S=Джерело T=Прайс EUR U=Вага/шт V=Вага Китай W=Вага Євро X=Додано
+            r = start_row
 
             if is_stock:
                 fn = f"=M{r}-T{r}*I{r}*F{r}"
@@ -259,79 +264,79 @@ def append_to_sheets(manager_name: str, inv: dict):
                 fo = "=0"
 
             row = [
-                "",                                              # A Менеджер (only in header)
-                "",                                              # B Клієнт (only in header)
-                "",                                              # C Рахунок (only in header)
-                "",                                              # D Дата (only in header)
-                item["article"],                                 # E
-                item["qty"],                                     # F
-                round(cost_eur, 2),                             # G
-                duty_pct,                                        # H
-                round(rate, 2),                                  # I
-                f"=G{r}*(1+H{r}/100)*I{r}",                    # J Собів UAH/шт
-                f"=J{r}*F{r}",                                  # K Собів загал
+                "",                                              # A Менеджер
+                "",                                              # B Клієнт
+                "",                                              # C Рахунок
+                "",                                              # D Дата
+                item["article"],                                 # E Артикул
+                item["qty"],                                     # F Кть
+                round(cost_eur, 2),                              # G Закуп EUR
+                duty_pct,                                        # H Мито%
+                round(rate, 2) if rate else "",                  # I Курс
+                f"=G{r}*(1+H{r}/100)*I{r}",                      # J Собів UAH/шт
+                f"=J{r}*F{r}",                                   # K Собів загал
                 item["price_uah"],                               # L Ціна прод
-                f"=L{r}*F{r}",                                  # M Виторг
+                f"=L{r}*F{r}",                                   # M Виторг
                 fn,                                              # N Прибуток S
                 fo,                                              # O Надбавка T
                 "так" if is_stock else "",                       # P Склад?
-                lu.get("uktved", ""),                           # Q УКТЗЕД
-                lu.get("brand", ""),                            # R Бренд
+                lu.get("uktved", ""),                            # Q УКТЗЕД
+                lu.get("brand", ""),                             # R Бренд
                 source,                                          # S Джерело
-                round(price_eur, 2) if price_eur else "",       # T Прайс EUR
-                round(weight_unit, 3) if weight_unit else "",   # U Вага/шт
-                f'=IF(P{r}="так",IF(REGEXMATCH(LOWER(S{r}),"китай"),U{r}*F{r},0),0)',  # V Вага Китай
-                f'=IF(P{r}="так",IF(REGEXMATCH(LOWER(S{r}),"e-trade"),U{r}*F{r},0),0)', # W Вага Євро
-                datetime.now().strftime("%d.%m.%Y %H:%M"),      # X Додано
+                round(price_eur, 2) if price_eur else "",        # T Прайс EUR
+                round(weight_unit, 3) if weight_unit else "",    # U Вага/шт
+                f'=IF(P{r}="так",IF(REGEXMATCH(LOWER(S{r}),"китай"),U{r}*F{r},0),0)',  # V
+                f'=IF(P{r}="так",IF(REGEXMATCH(LOWER(S{r}),"e-trade"),U{r}*F{r},0),0)', # W
+                datetime.now().strftime("%d.%m.%Y %H:%M"),       # X
             ]
+            rows_to_write.append(row)
+            all_sheet_rows.append(row)
 
-            # Write row with formulas
-            ws_mgr.update(f"A{r}:X{r}", [row], value_input_option="USER_ENTERED")
-
-            # Color only article cell red for stock items
             if is_stock:
-                ws_mgr.format(f"E{r}", {
-                    "backgroundColor": {"red": 0.99, "green": 0.87, "blue": 0.87},
-                    "textFormat": {"bold": True, "foregroundColor": {"red": 0.8, "green": 0.0, "blue": 0.0}}
-                })
+                stock_rows.append(r)
 
-            # Format numeric columns to 2 decimal places
-            # G=Закуп EUR, H=Мито%, I=Курс, J=Собів/шт, K=Собів загал
-            # L=Ціна прод, M=Виторг, N=Прибуток S, O=Надбавка T, T=Прайс EUR
-            # U=Вага/шт, V=Вага Китай, W=Вага Євро
-            num_fmt = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}
-            for col_letter in ["G", "I", "J", "K", "L", "M", "N", "O", "T", "U", "V", "W"]:
-                ws_mgr.format(f"{col_letter}{r}", num_fmt)
-            # Мито% - integer
-            ws_mgr.format(f"H{r}", {"numberFormat": {"type": "NUMBER", "pattern": "0.00"}})
+            start_row += 1
 
-            # Write plain values to ВСІ
-            plain = [
-                manager_name, client, invoice_num, date,
-                item["article"], item["qty"],
-                round(cost_eur, 2), duty_pct, round(rate, 2),
-                round(cost_eur*(1+duty)*rate, 2),
-                round(cost_eur*(1+duty)*rate*item["qty"], 2),
-                item["price_uah"],
-                round(item["price_uah"]*item["qty"], 2),
-                round((item["price_uah"] - (price_eur or cost_eur*(1+duty))*rate)*item["qty"], 2) if is_stock else round(item["price_uah"]*item["qty"] - cost_eur*(1+duty)*rate*item["qty"], 2),
-                round(item["price_uah"]*item["qty"] - cost_eur*(1+duty)*rate*item["qty"] - (item["price_uah"] - (price_eur or cost_eur*(1+duty))*rate)*item["qty"], 2) if is_stock else 0,
-                "так" if is_stock else "",
-                lu.get("uktved", ""), lu.get("brand", ""), source,
-                round(price_eur, 2) if price_eur else "",
-                round(weight_unit, 3) if weight_unit else "",
-                "", "",
-                datetime.now().strftime("%d.%m.%Y %H:%M"),
-            ]
-            ws_all.append_row(plain, value_input_option="USER_ENTERED")
+        # ── ONE batch write to manager sheet ──────────────────────────────────
+        first_row = len(existing) + 1
+        last_row = first_row + len(rows_to_write) - 1
+        ws_mgr.update(
+            f"A{first_row}:X{last_row}",
+            rows_to_write,
+            value_input_option="USER_ENTERED"
+        )
 
-            cur += 1
+        # ── Number formatting (batch) ─────────────────────────────────────────
+        num_format = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}
+        # Only data rows (skip separator and header)
+        data_start = first_row + (2 if existing and len(existing) > 1 else 1)
+        if data_start <= last_row:
+            for col in ["G", "H", "I", "J", "K", "L", "M", "N", "O", "T", "U", "V", "W"]:
+                ws_mgr.format(f"{col}{data_start}:{col}{last_row}", num_format)
+
+        # ── Color stock article cells ─────────────────────────────────────────
+        for sr in stock_rows:
+            ws_mgr.format(f"E{sr}", {
+                "backgroundColor": {"red": 0.99, "green": 0.87, "blue": 0.87},
+                "textFormat": {"bold": True, "foregroundColor": {"red": 0.8, "green": 0.0, "blue": 0.0}}
+            })
+
+        # ── Apply separator/header formatting ─────────────────────────────────
+        for req in format_requests:
+            ws_mgr.format(req["range"], req["format"])
+
+        # ── Append to ВСІ sheet (single batch) ────────────────────────────────
+        try:
+            ws_all.append_rows(all_sheet_rows, value_input_option="USER_ENTERED")
+        except Exception as e:
+            logger.warning(f"ВСІ append error: {e}")
 
         return True
     except Exception as e:
         logger.error(f"Sheet append error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False
-
 
 # ── Storage ───────────────────────────────────────────────────────────────────
 def _uf(uid): return DATA_DIR / f"{uid}.json"
