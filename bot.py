@@ -41,6 +41,13 @@ try:
 except:
     PRICE_LOOKUP: dict = {}
 
+# Invoice-specific lookup: "invoice_num:article" -> record
+try:
+    with open("invoice_lookup.json", encoding="utf-8") as f:
+        INVOICE_LOOKUP: dict = json.load(f)
+except:
+    INVOICE_LOOKUP: dict = {}
+
 def get_price(art: str) -> float:
     return PRICE_LOOKUP.get(art, 0)
 
@@ -188,6 +195,9 @@ def append_to_sheets(manager_name: str, inv: dict):
         invoice_num = inv.get("invoice_num", "")
         date = inv.get("date", "")
         items = inv.get("items", [])
+        import re as re_sh
+        m_sh = re_sh.search(r'[№#No]+\s*(\d+)', invoice_num)
+        inv_number = m_sh.group(1) if m_sh else ""
 
         # Step 1: get current row count
         existing = ws_mgr.get_all_values()
@@ -214,7 +224,7 @@ def append_to_sheets(manager_name: str, inv: dict):
 
         # Step 4: one row per item with formulas
         for item in items:
-            lu = lookup_article(item["article"])
+            lu = lookup_article(item["article"], inv_number)
             cost_eur = lu.get("cost_eur", 0)
             duty = lu.get("duty", 0.04)
             price_eur = get_price(item["article"])
@@ -238,10 +248,10 @@ def append_to_sheets(manager_name: str, inv: dict):
                 fo = "=0"
 
             row = [
-                manager_name,                                    # A
-                client,                                          # B
-                invoice_num,                                     # C
-                date,                                            # D
+                "",                                              # A Менеджер (only in header)
+                "",                                              # B Клієнт (only in header)
+                "",                                              # C Рахунок (only in header)
+                "",                                              # D Дата (only in header)
                 item["article"],                                 # E
                 item["qty"],                                     # F
                 round(cost_eur, 2),                             # G
@@ -267,10 +277,11 @@ def append_to_sheets(manager_name: str, inv: dict):
             # Write row with formulas
             ws_mgr.update(f"A{r}:X{r}", [row], value_input_option="USER_ENTERED")
 
-            # Color stock rows red
+            # Color only article cell red for stock items
             if is_stock:
-                ws_mgr.format(f"A{r}:X{r}", {
-                    "backgroundColor": {"red": 0.99, "green": 0.87, "blue": 0.87}
+                ws_mgr.format(f"E{r}", {
+                    "backgroundColor": {"red": 0.99, "green": 0.87, "blue": 0.87},
+                    "textFormat": {"bold": True, "foregroundColor": {"red": 0.8, "green": 0.0, "blue": 0.0}}
                 })
 
             # Write plain values to ВСІ
@@ -424,11 +435,29 @@ def parse_pdf(path: str) -> dict:
             except: pass
     return result
 
-def lookup_article(art):
-    # Try live cache first, fallback to static lookup.json
+def lookup_article(art: str, invoice_num: str = "") -> dict:
+    art = art.strip()
+    # Try invoice-specific lookup first (most accurate)
+    if invoice_num:
+        inv_key = f"{invoice_num}:{art}"
+        if inv_key in INVOICE_LOOKUP:
+            rec = INVOICE_LOOKUP[inv_key]
+            if rec.get("cost_eur", 0) > 0:
+                return rec
+    # Try live cache
     if ORDERS_SHEET_ID and _live_cache:
-        return _live_cache.get(art, LOOKUP.get(art, {}))
-    return LOOKUP.get(art, {})
+        result = _live_cache.get(art)
+        if result:
+            return result
+    # Exact match in static lookup
+    if art in LOOKUP:
+        return LOOKUP[art]
+    # Normalized match (handle extra spaces)
+    art_norm = " ".join(art.upper().split())
+    for key, val in LOOKUP.items():
+        if " ".join(key.upper().split()) == art_norm:
+            return val
+    return {}
 
 # ── Excel builder ─────────────────────────────────────────────────────────────
 def build_excel(manager_name, invoices, month):
@@ -462,7 +491,7 @@ def build_excel(manager_name, invoices, month):
     row = 3
     for inv in invoices:
         for item in inv.get("items",[]):
-            lu = lookup_article(item["article"])
+            lu = lookup_article(item["article"], inv_number)
             cost_eur = lu.get("cost_eur",0)
             duty = lu.get("duty",0.04)
             rate = item.get("rate", inv.get("rate",52.0))
@@ -580,9 +609,16 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("❌ Не вдалось розпізнати позиції в PDF.")
         return
 
+    # Extract invoice number for precise lookup
+    inv_number = ""
+    import re as re_inv
+    m_inv = re_inv.search(r'[№#No]+\s*(\d+)', parsed.get("invoice_num", ""))
+    if m_inv:
+        inv_number = m_inv.group(1)
+
     found, not_found = [], []
     for item in parsed["items"]:
-        lu = lookup_article(item["article"])
+        lu = lookup_article(item["article"], inv_number)
         if lu.get("cost_eur"):
             item.update(lu)
             found.append(item["article"])
@@ -609,11 +645,10 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not_found:
         lines.append(f"⚠️ Не знайдено ({len(not_found)}): {', '.join(not_found)}")
 
-    # Auto-get date from lookup (Дата підтвердження замовлення)
-    # Use date from first found item, or today
+    # Auto-get date from lookup - prefer invoice-specific record
     auto_date = ""
     for item in parsed["items"]:
-        lu = lookup_article(item["article"])
+        lu = lookup_article(item["article"], inv_number)
         d = lu.get("confirm_date", "")
         if d:
             auto_date = d
@@ -801,7 +836,7 @@ async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     total_revenue = 0
     for inv in invoices:
         for item in inv.get("items",[]):
-            lu = lookup_article(item["article"])
+            lu = lookup_article(item["article"], inv_number)
             cost_eur = lu.get("cost_eur",0)
             duty = lu.get("duty",0.04)
             rate = item.get("rate", inv.get("rate",52.0))
@@ -861,7 +896,7 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             profit = 0
             for inv in invoices:
                 for item in inv.get("items",[]):
-                    lu = lookup_article(item["article"])
+                    lu = lookup_article(item["article"], inv_number)
                     cost_eur = lu.get("cost_eur",0)
                     duty = lu.get("duty",0.04)
                     rate = item.get("rate",52.0)
