@@ -429,7 +429,7 @@ def build_excel(manager_name, invoices, month):
     return path
 
 # ── States ────────────────────────────────────────────────────────────────────
-WAIT_NAME, WAIT_DATE, WAIT_STOCK, WAIT_DELIVERY = range(4)
+WAIT_NAME, WAIT_DATE, WAIT_STOCK, WAIT_DELIVERY, WAIT_EXCEL = range(5)
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -443,7 +443,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/report — Excel з ЗП за місяць\n"
             "/clear — очистити місяць\n"
             "/name — змінити ім'я"
-            + ("\n/admin — всі менеджери" if update.effective_user.id in ADMIN_IDS else "")
+            + ("\n/admin — всі менеджери\n/update — оновити довідник" if update.effective_user.id in ADMIN_IDS else "")
         )
     else:
         await update.message.reply_text("👋 Привіт! Як тебе звати? (введи ім'я)")
@@ -741,6 +741,130 @@ async def cmd_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Введи нове ім'я:")
     return WAIT_NAME
 
+async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin only: update lookup from Excel file"""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Немає доступу.")
+        return
+    await update.message.reply_text(
+        "📂 Надішли Excel файл таблиці замовлень (.xlsx)\n"
+        "Аркуші мають називатись: *E-Trade Automation* та *Китай*",
+        parse_mode="Markdown"
+    )
+    return WAIT_EXCEL
+
+async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Process uploaded Excel and rebuild lookup.json"""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Немає доступу.")
+        return ConversationHandler.END
+
+    doc = update.message.document
+    if not doc.file_name.endswith('.xlsx'):
+        await update.message.reply_text("❌ Потрібен .xlsx файл")
+        return WAIT_EXCEL
+
+    msg = await update.message.reply_text("⏳ Оновлюю довідник...")
+
+    try:
+        import pandas as pd
+
+        file = await ctx.bot.get_file(doc.file_id)
+        xlsx_path = str(DATA_DIR / f"orders_{doc.file_id}.xlsx")
+        await file.download_to_drive(xlsx_path)
+
+        xl = pd.ExcelFile(xlsx_path)
+        sheets = xl.sheet_names
+        
+        dfs = []
+        for sheet in sheets:
+            try:
+                df = pd.read_excel(xl, sheet_name=sheet, header=0)
+                df['_src'] = sheet
+                dfs.append(df)
+            except Exception as e:
+                logger.warning(f"Sheet {sheet} error: {e}")
+
+        if not dfs:
+            await msg.edit_text("❌ Не вдалось прочитати аркуші")
+            return ConversationHandler.END
+
+        import os as os_mod
+        os_mod.remove(xlsx_path)
+
+        # Find article and price columns automatically
+        lookup = {}
+        total = 0
+        for df in dfs:
+            src = df['_src'].iloc[0] if '_src' in df.columns else ''
+            cols = [str(c).strip().lower() for c in df.columns]
+            
+            def find_col(keywords):
+                for kw in keywords:
+                    for i, c in enumerate(cols):
+                        if kw in c: return i
+                return -1
+
+            art_i     = find_col(['артикул'])
+            price_i   = find_col(['ціна за одиницю', 'price'])
+            uktved_i  = find_col(['код товару', 'уктзед'])
+            duty_i    = find_col(['мито'])
+            weight_i  = find_col(['нетто за 1', 'вага', 'weight'])
+            brand_i   = find_col(['виробник', 'brand'])
+
+            if art_i < 0:
+                continue
+
+            for _, row in df.iterrows():
+                art = str(row.iloc[art_i]).strip()
+                if not art or art == 'nan' or art == 'Артикул':
+                    continue
+                try:
+                    price = float(str(row.iloc[price_i]).replace(',','.').replace(' ','')) if price_i >= 0 else 0
+                except: price = 0
+                try:
+                    duty = float(str(row.iloc[duty_i]).replace(',','.').replace(' ','').replace('%','')) if duty_i >= 0 else 0.04
+                    if duty > 1: duty = duty / 100
+                except: duty = 0.04
+                try:
+                    weight = float(str(row.iloc[weight_i]).replace(',','.').replace(' ','')) if weight_i >= 0 else 0
+                except: weight = 0
+                try:
+                    brand = str(row.iloc[brand_i]).strip() if brand_i >= 0 else ''
+                except: brand = ''
+
+                lookup[art] = {
+                    'uktved': str(row.iloc[uktved_i]).strip() if uktved_i >= 0 and uktved_i < len(row) else '',
+                    'duty': duty,
+                    'cost_eur': price,
+                    'weight': weight,
+                    'brand': brand if brand != 'nan' else '',
+                    'source': src,
+                }
+                total += 1
+
+        # Save new lookup.json
+        import json as json_mod
+        with open('lookup.json', 'w', encoding='utf-8') as f:
+            json_mod.dump(lookup, f, ensure_ascii=False, indent=2)
+
+        # Also update in-memory LOOKUP
+        LOOKUP.clear()
+        LOOKUP.update(lookup)
+
+        await msg.edit_text(
+            f"✅ *Довідник оновлено!*\n\n"
+            f"📦 Артикулів: *{len(lookup)}*\n"
+            f"📋 Аркушів: {len(dfs)} ({', '.join(sheets[:3])})",
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        logger.error(f"Excel update error: {e}")
+        await msg.edit_text(f"❌ Помилка: {e}")
+
+    return ConversationHandler.END
+
 async def cmd_sheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if SHEET_ID:
         await update.message.reply_text(
@@ -756,6 +880,7 @@ def main():
             MessageHandler(filters.Document.PDF, handle_pdf),
             CommandHandler("report", cmd_report),
             CommandHandler("name", cmd_name),
+            CommandHandler("update", cmd_update),
         ],
         states={
             WAIT_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, set_name)],
@@ -766,12 +891,16 @@ def main():
             ],
             WAIT_DELIVERY: [MessageHandler(filters.TEXT, handle_delivery),
                             CommandHandler("0", handle_delivery)],
+            WAIT_EXCEL: [MessageHandler(filters.Document.MimeType(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ), handle_excel_update)],
         },
         fallbacks=[CommandHandler("start", start)],
         allow_reentry=True,
     )
     app.add_handler(conv)
     app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("sheet", cmd_sheet))
     app.add_handler(CallbackQueryHandler(callback_clear, pattern="^clear_"))
