@@ -200,21 +200,27 @@ def get_or_create_ws(spreadsheet, name: str):
     try:
         return spreadsheet.worksheet(name)
     except gspread.WorksheetNotFound:
+        pass
+    try:
         ws = spreadsheet.add_worksheet(title=name, rows=500, cols=20)
-        headers = ["Менеджер","Клієнт","Рахунок","Дата оплати","Артикул",
-                   "Кть","Закуп EUR","Мито%","Курс",
-                   "Собів UAH/шт","Собів загал",
-                   "Ціна прод UAH","Виторг",
-                   "Прибуток (S)","Надбавка (T)","Склад?",
-                   "УКТЗЕД","Бренд","Джерело",
-                   "Прайс EUR","Вага/шт","Вага Китай","Вага Європа","Додано"]
-        ws.append_row(headers)
-        ws.format("A1:S1", {
-            "backgroundColor": {"red":0.17,"green":0.18,"blue":0.24},
-            "textFormat": {"bold":True,"foregroundColor":{"red":1,"green":1,"blue":1}},
-            "horizontalAlignment": "CENTER"
-        })
-        return ws
+    except gspread.exceptions.APIError as e:
+        if "already exists" in str(e):
+            return spreadsheet.worksheet(name)
+        raise
+    headers = ["Менеджер","Клієнт","Рахунок","Дата оплати","Артикул",
+               "Кть","Закуп EUR","Мито%","Курс",
+               "Собів UAH/шт","Собів загал",
+               "Ціна прод UAH","Виторг",
+               "Прибуток (S)","Надбавка (T)","Склад?",
+               "УКТЗЕД","Бренд","Джерело",
+               "Прайс EUR","Вага/шт","Вага Китай","Вага Європа","Додано"]
+    ws.append_row(headers)
+    ws.format("A1:X1", {
+        "backgroundColor": {"red":0.17,"green":0.18,"blue":0.24},
+        "textFormat": {"bold":True,"foregroundColor":{"red":1,"green":1,"blue":1}},
+        "horizontalAlignment": "CENTER"
+    })
+    return ws
 
 def append_to_sheets(manager_name: str, inv: dict):
     """Write invoice to Google Sheets using BATCH updates for speed."""
