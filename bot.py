@@ -558,46 +558,55 @@ def parse_pdf(path: str) -> dict:
     return result
 
 def lookup_article(art: str, invoice_num: str = "", is_stock: bool = False) -> dict:
-    """Find article record.
-    For stock items: 1) invoice-specific 2) stock_lookup (latest "Склад" record) 3) any
-    For non-stock: 1) invoice-specific 2) latest with price
-    """
+    """Find article record. INVOICE MATCH ALWAYS WINS over stock_lookup."""
     art = art.strip()
 
-    # Priority 1: Invoice-specific record (for non-stock items)
-    if invoice_num and not is_stock:
+    # 1) Invoice-specific match - ALWAYS highest priority
+    # If we have a record for THIS exact invoice, use it (regardless of stock flag)
+    if invoice_num:
         inv_key = f"{invoice_num}:{art}"
         if inv_key in INVOICE_LOOKUP:
             rec = INVOICE_LOOKUP[inv_key]
             if rec.get("cost_eur", 0) > 0:
                 return rec
 
-    # Priority 2 (stock): use stock_lookup (latest "Склад" purchase)
-    if is_stock:
-        if art in STOCK_LOOKUP:
-            rec = STOCK_LOOKUP[art]
-            if rec.get("cost_eur", 0) > 0:
-                return rec
-        # Even for stock, check invoice match first
-        if invoice_num:
-            inv_key = f"{invoice_num}:{art}"
-            if inv_key in INVOICE_LOOKUP:
-                rec = INVOICE_LOOKUP[inv_key]
-                if rec.get("cost_eur", 0) > 0:
-                    return rec
+    # 2) Stock lookup - only if marked as stock by user
+    if is_stock and art in STOCK_LOOKUP:
+        rec = STOCK_LOOKUP[art]
+        if rec.get("cost_eur", 0) > 0:
+            return rec
 
-    # Fallback: live cache or general lookup
+    # 3) General lookup (latest with price)
+    if art in LOOKUP:
+        rec = LOOKUP[art]
+        if rec.get("cost_eur", 0) > 0:
+            return rec
+
+    # 4) Stock lookup fallback (even if not marked)
+    if art in STOCK_LOOKUP:
+        rec = STOCK_LOOKUP[art]
+        if rec.get("cost_eur", 0) > 0:
+            return rec
+
+    # 5) Invoice match with 0 price (item in transit)
+    if invoice_num:
+        inv_key = f"{invoice_num}:{art}"
+        if inv_key in INVOICE_LOOKUP:
+            return INVOICE_LOOKUP[inv_key]
+
+    # 6) Live cache
     if ORDERS_SHEET_ID and _live_cache:
         result = _live_cache.get(art)
         if result:
             return result
-    if art in LOOKUP:
-        return LOOKUP[art]
+
+    # 7) Fuzzy match
     art_norm = " ".join(art.upper().split())
     for key, val in LOOKUP.items():
         if " ".join(key.upper().split()) == art_norm:
             return val
-    return {}
+
+    return LOOKUP.get(art, {})
 
 # ── Excel builder ─────────────────────────────────────────────────────────────
 def build_excel(manager_name, invoices, month):
