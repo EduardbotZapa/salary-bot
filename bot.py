@@ -308,8 +308,8 @@ def append_to_sheets(manager_name: str, inv: dict):
                 source,                                          # S Джерело
                 round(price_eur, 2) if price_eur else "",        # T Прайс EUR
                 round(weight_unit, 3) if weight_unit else "",    # U Вага/шт
-                f'=IF(AND($P{r}="так",$S{r}="Китай"),$U{r}*$F{r},0)',  # V
-                f'=IF(AND($P{r}="так",$S{r}="E-Trade Automation"),$U{r}*$F{r},0)', # W
+                round(weight_unit * item["qty"], 3) if (is_stock and source == "Китай") else 0,  # V Вага Китай
+                round(weight_unit * item["qty"], 3) if (is_stock and "trade" in source.lower()) else 0,  # W Вага Європа
                 datetime.now().strftime("%d.%m.%Y %H:%M"),       # X
             ]
             rows_to_write.append(row)
@@ -500,25 +500,61 @@ def parse_pdf(path: str) -> dict:
     if m2:
         result["client"] = shorten_company(m2.group(1).strip()[:120])
 
-    item_pat = re.compile(
-        r"\d{1,3}\s+[\w\s,\-\'\.]+?([A-Z0-9][A-Z0-9\-\/\.]{4,})\s+(\d+)\s+шт\s+([\d\s]+[,.][\d]{2})\s+([\d\s]+[,.][\d]{2})"
-    )
+    # ── Method 1: Match known articles from lookup directly in text ──────────
+    # Build sorted list of known articles (longest first to match more specific)
+    known_articles = sorted(LOOKUP.keys(), key=len, reverse=True)
     seen = set()
-    for m in item_pat.finditer(text):
-        art = m.group(1).strip()
-        if art in seen: continue
-        seen.add(art)
-        try:
-            price = float(m.group(3).replace(" ","").replace(",","."))
-            result["items"].append({"article":art,"qty":int(m.group(2)),"price_uah":price})
-        except: pass
 
+    for art in known_articles:
+        if art in seen:
+            continue
+        # Escape special regex chars in article name
+        art_escaped = re.escape(art)
+        # Find lines containing this article
+        for m in re.finditer(art_escaped, text):
+            # Look at the surrounding line for qty and price
+            start = max(0, m.start() - 5)
+            end = min(len(text), m.end() + 200)
+            chunk = text[start:end]
+            # Pattern: article ... qty шт ... price ... total
+            line_pat = re.search(
+                re.escape(art) + r"\s+(\d+)\s*шт\s+([\d\s]+[,.]\d{2})",
+                chunk
+            )
+            if line_pat:
+                try:
+                    qty = int(line_pat.group(1))
+                    price = float(line_pat.group(2).replace(" ","").replace(",","."))
+                    if qty > 0 and price > 0:
+                        result["items"].append({"article": art, "qty": qty, "price_uah": price})
+                        seen.add(art)
+                        break
+                except: pass
+
+    # ── Method 2: Generic regex for any article-looking pattern (fallback) ───
     if not result["items"]:
-        for m in re.finditer(r"([A-Z0-9][A-Z0-9\-\/\.]{5,})\s+(\d{1,3})\s+шт\s+([\d\s]+[,.][\d]{2})", text):
+        # Match line format: "№ Назва товару АРТИКУЛ qty шт price total"
+        # Articles can contain: A-Z, 0-9, -, /, +, ., (, )
+        item_pat = re.compile(
+            r"\d{1,3}\s+[\w\s,\-\'\.]+?"
+            r"([A-Z0-9][A-Z0-9\-\/\.\+\(\)]{4,})"
+            r"\s+(\d+)\s+шт\s+([\d\s]+[,.]\d{2})\s+([\d\s]+[,.]\d{2})"
+        )
+        for m in item_pat.finditer(text):
+            art = m.group(1).strip()
+            if art in seen: continue
+            seen.add(art)
             try:
-                result["items"].append({"article":m.group(1).strip(),"qty":int(m.group(2)),
-                                        "price_uah":float(m.group(3).replace(" ","").replace(",","."))})
+                price = float(m.group(3).replace(" ","").replace(",","."))
+                result["items"].append({"article":art,"qty":int(m.group(2)),"price_uah":price})
             except: pass
+
+        if not result["items"]:
+            for m in re.finditer(r"([A-Z0-9][A-Z0-9\-\/\.\+\(\)]{5,})\s+(\d{1,3})\s+шт\s+([\d\s]+[,.]\d{2})", text):
+                try:
+                    result["items"].append({"article":m.group(1).strip(),"qty":int(m.group(2)),
+                                            "price_uah":float(m.group(3).replace(" ","").replace(",","."))})
+                except: pass
     return result
 
 def lookup_article(art: str, invoice_num: str = "", is_stock: bool = False) -> dict:
