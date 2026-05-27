@@ -506,36 +506,36 @@ def parse_pdf(path: str) -> dict:
     if m2:
         result["client"] = shorten_company(m2.group(1).strip()[:120])
 
-    # ── Method 1: Match known articles from lookup directly in text ──────────
-    # Build sorted list of known articles (longest first to match more specific)
-    known_articles = sorted(LOOKUP.keys(), key=len, reverse=True)
-    seen = set()
+    # ── Method 1: Find articles in PDF text PRESERVING ORDER from PDF ──────
+    # Scan text positions, longer articles take precedence on overlap
+    known_set = set(LOOKUP.keys())
+    found_items = []  # list of (text_position, article, qty, price)
+    seen_positions = set()
 
-    for art in known_articles:
-        if art in seen:
-            continue
-        # Escape special regex chars in article name
+    # Sort articles by length DESCENDING so longer ones match first (avoid substring matches)
+    sorted_known = sorted(known_set, key=len, reverse=True)
+
+    for art in sorted_known:
         art_escaped = re.escape(art)
-        # Find lines containing this article
-        for m in re.finditer(art_escaped, text):
-            # Look at the surrounding line for qty and price
-            start = max(0, m.start() - 5)
-            end = min(len(text), m.end() + 200)
-            chunk = text[start:end]
-            # Pattern: article ... qty шт ... price ... total
-            line_pat = re.search(
-                re.escape(art) + r"\s+(\d+)\s*шт\s+([\d\s]+[,.]\d{2})",
-                chunk
-            )
-            if line_pat:
-                try:
-                    qty = int(line_pat.group(1))
-                    price = float(line_pat.group(2).replace(" ","").replace(",","."))
-                    if qty > 0 and price > 0:
-                        result["items"].append({"article": art, "qty": qty, "price_uah": price})
-                        seen.add(art)
-                        break
-                except: pass
+        pattern = art_escaped + r"\s+(\d+)\s*шт\s+([\d\s]+[,.]\d{2})"
+        for m in re.finditer(pattern, text):
+            pos = m.start()
+            # Skip if this position overlaps with already-found article
+            if any(abs(pos - p) < len(art) for p in seen_positions):
+                continue
+            try:
+                qty = int(m.group(1))
+                price = float(m.group(2).replace(" ","").replace(",","."))
+                if qty > 0 and price > 0:
+                    found_items.append((pos, art, qty, price))
+                    seen_positions.add(pos)
+                    break  # one match per article
+            except: pass
+
+    # Sort by position in text to preserve PDF order
+    found_items.sort(key=lambda x: x[0])
+    for pos, art, qty, price in found_items:
+        result["items"].append({"article": art, "qty": qty, "price_uah": price})
 
     # ── Method 2: Generic regex for any article-looking pattern (fallback) ───
     if not result["items"]:
