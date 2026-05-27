@@ -799,20 +799,24 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"⚠️ Не знайдено ({len(not_found)}): {', '.join(not_found)}")
 
     # ── Date & rate logic ────────────────────────────────────────────────────
-    # Try to find date from non-stock item in orders table
+    # Find date ONLY from invoice-specific records (matching THIS invoice number)
+    # Stock items from general lookup don't count - we need explicit confirmation
     auto_date = ""
-    for item in parsed["items"]:
-        lu = lookup_article(item["article"], inv_number)
-        d = lu.get("confirm_date", "")
-        if d:
-            auto_date = d
-            break
+    if inv_number:
+        for item in parsed["items"]:
+            inv_key = f"{inv_number}:{item['article']}"
+            if inv_key in INVOICE_LOOKUP:
+                rec = INVOICE_LOOKUP[inv_key]
+                d = rec.get("confirm_date", "")
+                if d:
+                    auto_date = d
+                    break
 
     items = ctx.user_data["pending_invoice"].get("items", [])
     ctx.user_data["stock_selected"] = set()
 
     if auto_date:
-        # Found date from orders table - get rate automatically
+        # Found date in invoice_lookup - non-stock items exist, use automatic date
         rate = await get_nbu_rate(auto_date)
         if rate:
             ctx.user_data["pending_invoice"]["rate"] = rate
@@ -833,7 +837,7 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return WAIT_STOCK
     else:
-        # All items are stock or not found - ask manager for date
+        # No invoice-specific records found - all stock, ask manager for date
         ctx.user_data["pending_invoice"]["rate"] = 0
         ctx.user_data["pending_invoice"]["date"] = ""
         lines.append(f"\n📅 Всі товари зі складу — введи дату оплати клієнтом (ДД.ММ.РРРР):")
