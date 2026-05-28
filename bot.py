@@ -23,50 +23,10 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 ADMIN_IDS    = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
-SALARY_PCT   = float(os.environ.get("SALARY_PCT", "20"))   # legacy, не використовується у каскадній формулі
+SALARY_PCT   = float(os.environ.get("SALARY_PCT", "20"))
 RATE_MARKUP  = float(os.environ.get("RATE_MARKUP", "2"))
 SHEET_ID     = os.environ.get("SHEET_ID", "")
 GOOGLE_CREDS = os.environ.get("GOOGLE_CREDS", "")
-
-# ── Salary cascade constants (з ручного Excel "Salary Ukraine") ──────────────
-# Формула ЗП повторює лесенку рядків 37-42 у вкладці місяця:
-#   S37 = ΣS − доставка/2          T37 = ΣT − доставка/2
-#   S38 = S37 / 2                  T38 = T37 / 2
-#   S39 = S38 × COEF_SHIPPED_PAID  T39 = T38 × COEF_SHIPPED_PAID  («відвантажено та оплачено»)
-#   S40 = S38 × COEF_WAREHOUSE     T40 = T38 × COEF_WAREHOUSE    («на складі / в дорозі»)
-#   S41 = S39 + S40                T41 = T39 + T40
-#   Чиста прибуток = S41 + T41
-#   S%  обирається з градації по чистому прибутку
-#   T%  завжди фіксований 15% (заголовок колонки T у Excel = 15,00)
-#   ЗП  = S41 × S% + T41 × T%
-# Бот завжди працює з закритими рахунками: якщо менеджер додав рахунок —
-# рахунок закритий, обидві гілки коефіцієнтів застосовуються як у ручному Excel.
-COEF_SHIPPED_PAID = 0.815 * 0.95 * 0.95 * 0.99   # ≈ 0.7288 — «відвантажено та оплачено»
-COEF_WAREHOUSE    = 0.95 * 0.99 * 0.99            # ≈ 0.9311 — «на складі в ПЛ або вже в дорозі»
-T_PERCENT_FIXED   = 0.15                          # фіксований % на Надбавку (колонка T)
-DELIVERY_DIVISOR  = 2                             # доставка ділиться на 2 (AD49 = AD48/2)
-SALARY_HALVE      = 2                             # каскад S38 = S37 / 2
-
-# Градація % на колонку S (Прибуток) за чистим прибутком (S41 + T41), у грн.
-# Список як (верхня межа, %). Перший рядок: 0 ≤ x < 38000 → 0%
-SALARY_BRACKETS = [
-    ( 38_000, 0.00),
-    ( 52_000, 0.10),
-    ( 84_000, 0.15),
-    (138_000, 0.20),
-    (184_000, 0.21),
-    (220_000, 0.22),
-    (275_000, 0.23),
-    (315_000, 0.24),
-    (float("inf"), 0.25),
-]
-
-def get_s_percent(net_profit: float) -> float:
-    """Повертає % на колонку S залежно від чистого прибутку (S41+T41)."""
-    for threshold, pct in SALARY_BRACKETS:
-        if net_profit < threshold:
-            return pct
-    return SALARY_BRACKETS[-1][1]
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -655,9 +615,6 @@ def lookup_article(art: str, invoice_num: str = "", is_stock: bool = False) -> d
     return LOOKUP.get(art, {})
 
 # ── Excel builder ─────────────────────────────────────────────────────────────
-# УВАГА: build_excel() — legacy-функція. /report з квітня 2026 використовує
-# build_excel_from_rows(), яка читає з Google Sheets і застосовує каскадну
-# формулу ЗП. Залишено для зворотньої сумісності, не викликається.
 def build_excel(manager_name, invoices, month):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -1074,64 +1031,6 @@ def read_sheet_rows_for_manager(manager_name: str):
         logger.error(f"read_sheet error: {e}")
         return None, str(e)
 
-def _num(v):
-    """Parse a string/number cell to float, return 0 on failure."""
-    try:
-        return float(str(v).replace("\xa0", "").replace(" ", "").replace(",", "."))
-    except:
-        return 0.0
-
-
-def calc_salary_cascade(total_s: float, total_t: float, delivery: float) -> dict:
-    """
-    Каскадний розрахунок ЗП за схемою з ручного Excel (вкладка місяця, рядки 37-42).
-    У боті статус позицій не важливий: якщо менеджер додав рахунок — рахунок закритий,
-    тому обидві гілки коефіцієнтів застосовуються як у ручному файлі.
-
-        S37 = ΣS − доставка/2                  T37 = ΣT − доставка/2
-        S38 = S37 / 2                          T38 = T37 / 2
-        S39 = S38 × COEF_SHIPPED_PAID          T39 = T38 × COEF_SHIPPED_PAID
-        S40 = S38 × COEF_WAREHOUSE             T40 = T38 × COEF_WAREHOUSE
-        S41 = S39 + S40                        T41 = T39 + T40
-        Чиста прибуток = S41 + T41
-        S% = градація(чиста прибуток)          T% = 15% (фіксовано)
-        S42 = S41 × S%                         T42 = T41 × T%
-        ЗП  = S42 + T42
-    """
-    half_delivery = delivery / DELIVERY_DIVISOR
-    s37 = total_s - half_delivery
-    t37 = total_t - half_delivery
-    s38 = s37 / SALARY_HALVE
-    t38 = t37 / SALARY_HALVE
-    # Обидві гілки: shipped&paid + warehouse/in-transit
-    s39 = s38 * COEF_SHIPPED_PAID
-    t39 = t38 * COEF_SHIPPED_PAID
-    s40 = s38 * COEF_WAREHOUSE
-    t40 = t38 * COEF_WAREHOUSE
-    s41 = s39 + s40
-    t41 = t39 + t40
-    # Чиста прибуток = сума двох колонок (визначає % градації для S)
-    net_profit = s41 + t41
-    s_pct = get_s_percent(net_profit)
-    t_pct = T_PERCENT_FIXED
-    s42 = s41 * s_pct
-    t42 = t41 * t_pct
-    salary = s42 + t42
-    return {
-        "total_s": total_s, "total_t": total_t,
-        "delivery": delivery, "half_delivery": half_delivery,
-        "s37": s37, "t37": t37,
-        "s38": s38, "t38": t38,
-        "s39": s39, "t39": t39,
-        "s40": s40, "t40": t40,
-        "s41": s41, "t41": t41,
-        "net_profit": net_profit,
-        "s_pct": s_pct, "t_pct": t_pct,
-        "s42": s42, "t42": t42,
-        "salary": salary,
-    }
-
-
 async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().replace("/","")
     try:
@@ -1156,49 +1055,62 @@ async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Sum profit from columns N (Прибуток S, idx 13) + O (Надбавка T, idx 14)
     # and revenue from M (Виторг, idx 12)
+    def num(v):
+        try:
+            return float(str(v).replace("\xa0","").replace(" ","").replace(",","."))
+        except:
+            return 0.0
+
     total_revenue = 0.0
-    total_s = 0.0
-    total_t = 0.0
+    total_profit = 0.0
     for r in rows:
-        total_revenue += _num(r[12])    # M Виторг
-        total_s       += _num(r[13])    # N Прибуток (S)
-        total_t       += _num(r[14])    # O Надбавка (T)
+        revenue = num(r[12])          # M Виторг
+        s_val = num(r[13])            # N Прибуток (S)
+        t_val = num(r[14])            # O Надбавка (T)
+        total_revenue += revenue
+        total_profit += (s_val + t_val)
 
-    casc = calc_salary_cascade(total_s, total_t, delivery)
+    net = total_profit - delivery
+    salary = max(0, net) * SALARY_PCT / 100
 
-    # Build Excel with the same cascade visualised in the totals block
-    path = build_excel_from_rows(name, rows, month, casc, total_revenue)
-
-    s_pct_disp = int(round(casc["s_pct"] * 100))
-    t_pct_disp = int(round(casc["t_pct"] * 100))
+    # Build simple Excel from sheet rows
+    path = build_excel_from_rows(name, rows, month, delivery, total_revenue, total_profit, net, salary)
 
     await update.message.reply_document(
-        document=open(path, "rb"),
+        document=open(path,"rb"),
         filename=f"ЗП_{name}_{month}.xlsx",
         caption=(
             f"📊 *Звіт за {month}*\n\n"
             f"Позицій: {len(rows)}\n"
             f"Виторг: *{total_revenue:,.0f} грн*\n"
-            f"ΣS (Прибуток): *{total_s:,.2f} грн*\n"
-            f"ΣT (Надбавка): *{total_t:,.2f} грн*\n"
-            f"Доставка: *{delivery:,.0f} грн* (−½ з кожної колонки)\n"
+            f"Прибуток (S+T): *{total_profit:,.0f} грн*\n"
+            f"Доставка: *{delivery:,.0f} грн*\n"
+            f"Чистий: *{net:,.0f} грн*\n"
             f"━━━━━━━━━━━━\n"
-            f"S41 = *{casc['s41']:,.2f}*   T41 = *{casc['t41']:,.2f}*\n"
-            f"Чиста прибуток (S41+T41): *{casc['net_profit']:,.2f} грн*\n"
-            f"Градація S: *{s_pct_disp}%*   |   T: *{t_pct_disp}%* (фікс)\n"
-            f"S × {s_pct_disp}% = *{casc['s42']:,.2f}*\n"
-            f"T × {t_pct_disp}% = *{casc['t42']:,.2f}*\n"
-            f"━━━━━━━━━━━━\n"
-            f"💰 *ЗП: {casc['salary']:,.2f} грн*"
+            f"💰 *ЗП ({SALARY_PCT}%): {salary:,.0f} грн*"
         ),
         parse_mode="Markdown"
     )
     return ConversationHandler.END
 
-def build_excel_from_rows(manager_name, rows, month, casc, total_revenue):
-    """
-    Build Excel report from Google Sheet rows.
-    `casc` — dict із calc_salary_cascade(): s37/t37, s38/t38, s39/t39, s42/t42, salary, delivery.
+def build_excel_from_rows(manager_name, rows, month, delivery, total_revenue, total_profit, net, salary):
+    """Build Excel report from Google Sheet rows.
+
+    ВСЕ вычисляемые поля и итоги пишутся ФОРМУЛАМИ Excel, а не готовыми числами.
+    Поэтому если поправить любой ввод (Кть, Закуп EUR, Мито%, Курс, Ціна, Прайс EUR
+    или Доставку) — себестоимость, выторг, прибуток S/T, чистий прибуток и ЗП
+    пересчитаются автоматически.
+
+    Колонки:
+      A Клієнт  B Рахунок  C Дата  D Артикул
+      E Кть(in) F Закуп EUR(in) G Мито%(in) H Курс(in)
+      I Собів/шт = F*(1+G/100)*H      J Собів загал = I*E
+      K Ціна UAH(in)                  L Виторг = K*E
+      M Прайс EUR(in)
+      N Прибуток S   O Надбавка T   P Склад?
+    Логика S/T та сама, що в append_to_sheets:
+      склад:    N = L - M*H*E ;  O = (L - J) - N
+      не склад: N = L - J     ;  O = 0
     """
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -1206,150 +1118,115 @@ def build_excel_from_rows(manager_name, rows, month, casc, total_revenue):
     thin = Side(style='thin', color='BDC3C7')
     brd = Border(left=thin,right=thin,top=thin,bottom=thin)
 
-    ws.merge_cells('A1:N1')
+    ws.merge_cells('A1:P1')
     ws['A1'] = f'РОЗРАХУНОК ЗП — {manager_name} — {month}'
     ws['A1'].font = Font(name='Arial',bold=True,size=13,color='FFFFFF')
     ws['A1'].fill = PatternFill('solid',fgColor='1F2D3D')
     ws['A1'].alignment = Alignment(horizontal='center',vertical='center')
     ws.row_dimensions[1].height = 26
 
-    headers = ['Клієнт','Рахунок','Дата','Артикул','Кть','Закуп EUR','Курс',
-               'Ціна UAH','Виторг','Прибуток S','Надбавка T','Склад?']
-    ws.row_dimensions[2].height = 30
+    headers = ['Клієнт','Рахунок','Дата','Артикул','Кть','Закуп EUR','Мито%','Курс',
+               'Собів/шт','Собів загал','Ціна UAH','Виторг','Прайс EUR',
+               'Прибуток S','Надбавка T','Склад?']
+    ws.row_dimensions[2].height = 32
     for c,h in enumerate(headers,1):
         cell = ws.cell(2,c,h)
-        cell.font = Font(name='Arial',bold=True,size=9,color='FFFFFF')
+        cell.font = Font(name='Arial',bold=True,size=8,color='FFFFFF')
         cell.fill = PatternFill('solid',fgColor='2C3E50')
         cell.alignment = Alignment(horizontal='center',vertical='center',wrap_text=True)
         cell.border = brd
-    for i,w in enumerate([18,20,11,22,5,10,8,12,13,13,13,8],1):
+    for i,w in enumerate([16,18,11,20,5,10,7,9,11,12,11,12,10,12,12,7],1):
         ws.column_dimensions[get_column_letter(i)].width = w
+
+    def num(v):
+        try: return float(str(v).replace("\xa0","").replace(" ","").replace(",","."))
+        except: return 0.0
+
+    # Колонки, которые должны быть в денежном формате
+    money_cols = [6,7,8,9,10,11,12,13,14,15]
 
     row = 3
     for r in rows:
         is_stock = (len(r) > 15 and r[15] == "так")
-        vals = [r[1], r[2], r[3], r[4], _num(r[5]), _num(r[6]), _num(r[8]),
-                _num(r[11]), _num(r[12]), _num(r[13]), _num(r[14]),
-                "так" if is_stock else ""]
+        price_eur = num(r[19]) if len(r) > 19 else 0.0
+
+        if is_stock:
+            f_s = f"=L{row}-M{row}*H{row}*E{row}"
+            f_t = f"=(L{row}-J{row})-N{row}"
+        else:
+            f_s = f"=L{row}-J{row}"
+            f_t = 0
+
+        vals = [
+            r[1],                                   # A Клієнт
+            r[2],                                   # B Рахунок
+            r[3],                                   # C Дата
+            r[4],                                   # D Артикул
+            num(r[5]),                              # E Кть          (ввод)
+            num(r[6]),                              # F Закуп EUR    (ввод)
+            num(r[7]),                              # G Мито%        (ввод)
+            num(r[8]),                              # H Курс         (ввод)
+            f"=F{row}*(1+G{row}/100)*H{row}",       # I Собів/шт     (формула)
+            f"=I{row}*E{row}",                      # J Собів загал  (формула)
+            num(r[11]),                             # K Ціна UAH     (ввод)
+            f"=K{row}*E{row}",                      # L Виторг       (формула)
+            price_eur,                              # M Прайс EUR    (ввод)
+            f_s,                                    # N Прибуток S   (формула)
+            f_t,                                    # O Надбавка T   (формула / 0)
+            "так" if is_stock else "",              # P Склад?
+        ]
         for c,v in enumerate(vals,1):
             cell = ws.cell(row,c,v)
             cell.font = Font(name='Arial',size=9)
             cell.border = brd
-            if c in [5,6,7,8,9,10,11]:
+            cell.alignment = Alignment(vertical='center')
+            if c in money_cols:
                 cell.number_format = '#,##0.00'
             cell.fill = PatternFill('solid',fgColor='FDECEA' if is_stock else ('F8F9FA' if row%2==0 else 'FFFFFF'))
         row += 1
 
+    last = row - 1  # последняя строка с данными
     TOT = row
-    ws.merge_cells(f'A{TOT}:H{TOT}')
+    ws.merge_cells(f'A{TOT}:K{TOT}')
     ws.cell(TOT,1,'ПІДСУМОК').font = Font(name='Arial',bold=True,size=10,color='FFFFFF')
     ws.cell(TOT,1).fill = PatternFill('solid',fgColor='1A5276')
     ws.cell(TOT,1).alignment = Alignment(horizontal='right')
-    for c in [9,10,11]:
+    # Суммы по Виторг(L), Прибуток S(N), Надбавка T(O) — формулами
+    for c in [12,14,15]:
         cl = get_column_letter(c)
-        cell = ws.cell(TOT,c,f'=SUM({cl}3:{cl}{TOT-1})')
+        formula = f'=SUM({cl}3:{cl}{last})' if last >= 3 else 0
+        cell = ws.cell(TOT,c,formula)
         cell.font = Font(name='Arial',bold=True,size=10,color='FFFFFF')
         cell.fill = PatternFill('solid',fgColor='1A5276')
         cell.number_format = '#,##0.00'
+        cell.border = brd
 
-    # ── Каскад розрахунку ЗП (як у ручному Salary Ukraine, рядки 37-42) ──────
+    # ── Итоговый блок (всё формулами, доставка — редактируемый ввод) ──────────
     SR = TOT + 2
-    coef_shipped_pct = round(COEF_SHIPPED_PAID * 100, 2)
-    coef_warehouse_pct = round(COEF_WAREHOUSE * 100, 2)
-    s_pct_disp = int(round(casc["s_pct"] * 100))
-    t_pct_disp = int(round(casc["t_pct"] * 100))
+    r_prof = SR        # Прибуток (S+T)
+    r_deliv = SR + 1   # Доставка (ввод)
+    r_net = SR + 2     # Чистий прибуток
+    r_zp = SR + 3      # ЗП
 
-    cascade = [
-        ("ΣS (Прибуток) — колонка J:",                     casc["total_s"],        casc["total_t"],        "ΣT (Надбавка) — колонка K"),
-        (f"− ½ доставки ({DELIVERY_DIVISOR} менеджери):",  -casc["half_delivery"], -casc["half_delivery"], "− ½ доставки"),
-        ("S37 = ΣS − ½доставки:",                          casc["s37"],            casc["t37"],            "T37 = ΣT − ½доставки"),
-        (f"S38 = S37 / {SALARY_HALVE}:",                   casc["s38"],            casc["t38"],            f"T38 = T37 / {SALARY_HALVE}"),
-        (f"S39 = S38 × {coef_shipped_pct}% (відвантаж.):", casc["s39"],            casc["t39"],            f"T39 = T38 × {coef_shipped_pct}%"),
-        (f"S40 = S38 × {coef_warehouse_pct}% (склад):",    casc["s40"],            casc["t40"],            f"T40 = T38 × {coef_warehouse_pct}%"),
-        ("S41 = S39 + S40:",                                casc["s41"],            casc["t41"],            "T41 = T39 + T40"),
+    labels = [
+        ('Прибуток (S+T) грн:', f'=N{TOT}+O{TOT}'),
+        ('▶ Доставка грн (можна редагувати):', round(delivery, 2)),
+        ('Чистий прибуток грн:', f'=D{r_prof}-D{r_deliv}'),
+        (f'ЗП ({SALARY_PCT}%) грн:', f'=MAX(0,D{r_net})*{SALARY_PCT}/100'),
     ]
-    for i, (label_s, val_s, val_t, label_t) in enumerate(cascade):
+    for i,(lbl,val) in enumerate(labels):
         r2 = SR + i
-        is_bold = i in (2, 6)   # S37, S41 — ключові рядки
-        # A-C: підпис S
         ws.merge_cells(f'A{r2}:C{r2}')
-        cl = ws.cell(r2, 1, label_s)
-        cl.font = Font(name='Arial', size=10, bold=is_bold)
-        cl.alignment = Alignment(horizontal='right', vertical='center')
-        # D: значення S
-        cv = ws.cell(r2, 4, round(val_s, 2))
+        ws.cell(r2,1,lbl).font = Font(name='Arial',size=10,bold=True)
+        ws.cell(r2,1).alignment = Alignment(horizontal='right')
+        cv = ws.cell(r2,4,val)
         cv.number_format = '#,##0.00'
-        cv.font = Font(name='Arial', size=10, bold=is_bold)
-        cv.border = brd
-        # F: значення T
-        cv2 = ws.cell(r2, 6, round(val_t, 2))
-        cv2.number_format = '#,##0.00'
-        cv2.font = Font(name='Arial', size=10, bold=is_bold)
-        cv2.border = brd
-        # G-I: підпис T
-        ws.merge_cells(f'G{r2}:I{r2}')
-        cl2 = ws.cell(r2, 7, label_t)
-        cl2.font = Font(name='Arial', size=10, bold=is_bold)
-        cl2.alignment = Alignment(horizontal='left', vertical='center')
-
-    # ── Чиста прибуток + градація ─────────────────────────────────────────────
-    NP = SR + len(cascade) + 1
-    ws.merge_cells(f'A{NP}:C{NP}')
-    ws.cell(NP, 1, 'Чиста прибуток (S41 + T41) грн:').font = Font(name='Arial', size=11, bold=True)
-    ws.cell(NP, 1).alignment = Alignment(horizontal='right', vertical='center')
-    np_cell = ws.cell(NP, 4, round(casc["net_profit"], 2))
-    np_cell.number_format = '#,##0.00'
-    np_cell.fill = PatternFill('solid', fgColor='EBF5FB')
-    np_cell.font = Font(name='Arial', size=11, color='1A5276', bold=True)
-    np_cell.border = brd
-    ws.merge_cells(f'G{NP}:I{NP}')
-    ws.cell(NP, 7, f'→ градація S: {s_pct_disp}%  |  T (фіксовано): {t_pct_disp}%').font = Font(name='Arial', size=10, italic=True)
-
-    # S × S%  +  T × T%
-    PR = NP + 1
-    ws.merge_cells(f'A{PR}:C{PR}')
-    ws.cell(PR, 1, f'S41 × {s_pct_disp}%:').font = Font(name='Arial', size=10, bold=True)
-    ws.cell(PR, 1).alignment = Alignment(horizontal='right')
-    cs = ws.cell(PR, 4, round(casc["s42"], 2))
-    cs.number_format = '#,##0.00'
-    cs.font = Font(name='Arial', size=10, bold=True)
-    cs.border = brd
-    ws.cell(PR, 6, round(casc["t42"], 2)).number_format = '#,##0.00'
-    ws.cell(PR, 6).font = Font(name='Arial', size=10, bold=True)
-    ws.cell(PR, 6).border = brd
-    ws.merge_cells(f'G{PR}:I{PR}')
-    ws.cell(PR, 7, f'T41 × {t_pct_disp}%').font = Font(name='Arial', size=10, bold=True)
-
-    # Фінальний рядок ЗП
-    FR = PR + 2
-    ws.merge_cells(f'A{FR}:C{FR}')
-    ws.cell(FR, 1, 'ЗП (S42 + T42) грн:').font = Font(name='Arial', size=12, bold=True)
-    ws.cell(FR, 1).alignment = Alignment(horizontal='right', vertical='center')
-    fin = ws.cell(FR, 4, round(casc["salary"], 2))
-    fin.number_format = '#,##0.00'
-    fin.fill = PatternFill('solid', fgColor='D5F5E3')
-    fin.font = Font(name='Arial', size=14, color='1E8449', bold=True)
-    fin.border = brd
-
-    # ── Довідник градації ─────────────────────────────────────────────────────
-    GR = FR + 3
-    ws.merge_cells(f'A{GR}:F{GR}')
-    ws.cell(GR, 1, 'Градація % на колонку S (Прибуток) за чистим прибутком:').font = Font(name='Arial', size=10, bold=True, italic=True)
-    GR += 1
-    grad_labels = [
-        ("0 – 38 000", "0%"),    ("38 000 – 52 000", "10%"),
-        ("52 000 – 84 000", "15%"), ("84 000 – 138 000", "20%"),
-        ("138 000 – 184 000", "21%"), ("184 000 – 220 000", "22%"),
-        ("220 000 – 275 000", "23%"), ("275 000 – 315 000", "24%"),
-        ("315 000+", "25%"),
-    ]
-    for i, (rng, pct) in enumerate(grad_labels):
-        r = GR + i
-        ws.cell(r, 1, rng).font = Font(name='Arial', size=9)
-        ws.cell(r, 2, pct).font = Font(name='Arial', size=9, bold=(pct == f"{s_pct_disp}%"))
-        if pct == f"{s_pct_disp}%":
-            ws.cell(r, 1).fill = PatternFill('solid', fgColor='FFF8DC')
-            ws.cell(r, 2).fill = PatternFill('solid', fgColor='FFF8DC')
+        if i == 1:  # доставка — подсветить как поле ввода
+            cv.fill = PatternFill('solid',fgColor='EBF5FB')
+            cv.font = Font(name='Arial',size=11,color='000080',bold=True)
+        elif i == 3:  # ЗП — итог
+            cv.fill = PatternFill('solid',fgColor='D5F5E3')
+            cv.font = Font(name='Arial',size=14,color='1E8449',bold=True)
 
     path = str(DATA_DIR/f"salary_{manager_name}_{month}.xlsx")
     wb.save(path)
@@ -1376,41 +1253,28 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Немає доступу.")
         return
-    lines = [f"📋 *Менеджери цього місяця:* (оцінка ЗП без урахування доставки)\n"]
+    lines = [f"📋 *Менеджери цього місяця:*\n"]
     for f in DATA_DIR.glob("*.json"):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             name = data.get("name", f.stem)
             invoices = data.get("invoices",[])
-            total_s = 0.0
-            total_t = 0.0
+            profit = 0
             for inv in invoices:
                 import re as re_a
                 m_a = re_a.search(r"[№#No]+\s*(\d+)", inv.get("invoice_num",""))
                 inv_num_a = m_a.group(1) if m_a else ""
                 for item in inv.get("items",[]):
                     lu = lookup_article(item["article"], inv_num_a, item.get("is_stock", False))
-                    cost_eur = lu.get("cost_eur", 0)
-                    duty = lu.get("duty", 0.04)
-                    rate = item.get("rate", 52.0)
-                    qty = item["qty"]
-                    cost_total = cost_eur * (1 + duty) * rate * qty
-                    revenue = item["price_uah"] * qty
-                    if item.get("is_stock"):
-                        price_eur = get_price(item["article"])
-                        s_val = revenue - price_eur * rate * qty
-                        t_val = (revenue - cost_total) - s_val
-                    else:
-                        s_val = revenue - cost_total
-                        t_val = 0
-                    total_s += s_val
-                    total_t += t_val
-            # Каскадний розрахунок (доставка = 0, бо адмін-огляд без її введення)
-            casc = calc_salary_cascade(total_s, total_t, 0)
-            lines.append(
-                f"👤 *{name}*: {len(invoices)} рахунків\n"
-                f"   ΣS: {total_s:,.0f} | ΣT: {total_t:,.0f} | ЗП≈ *{casc['salary']:,.0f} грн*\n"
-            )
+                    cost_eur = lu.get("cost_eur",0)
+                    duty = lu.get("duty",0.04)
+                    rate = item.get("rate",52.0)
+                    cost_uah = cost_eur*(1+duty)*rate*item["qty"]
+                    revenue = item["price_uah"]*item["qty"]
+                    p = (item["price_uah"]-cost_eur*(1+duty)*rate)*item["qty"] if item.get("is_stock") else revenue-cost_uah
+                    profit += p
+            salary = max(0,profit)*SALARY_PCT/100
+            lines.append(f"👤 *{name}*: {len(invoices)} рахунків\n   Прибуток: {profit:,.0f} грн | ЗП: {salary:,.0f} грн\n")
         except: pass
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
