@@ -1031,6 +1031,46 @@ def read_sheet_rows_for_manager(manager_name: str):
         logger.error(f"read_sheet error: {e}")
         return None, str(e)
 
+def read_sheet_grid_for_manager(manager_name: str):
+    """Read the FULL grid for a manager WITH FORMULAS preserved.
+
+    get_all_values() возвращает посчитанные числа; здесь мы запрашиваем
+    value_render_option='FORMULA', чтобы в ячейках остались сами формулы
+    (включая ручные коэффициенты типа *0.98*0.95, которые менеджер вписал
+    в онлайн-таблицу). Колонки и номера строк остаются как в таблице —
+    значит ссылки внутри формул остаются валидными при копировании 1:1.
+    Возвращает (grid, status), где grid — список строк (list[str]).
+    """
+    try:
+        sh = get_gsheet()
+        if not sh:
+            return None, "no_connection"
+        try:
+            ws = sh.worksheet(manager_name)
+        except gspread.WorksheetNotFound:
+            return [], "no_sheet"
+        grid = None
+        # пытаемся вытащить формулы (разные версии gspread по-разному)
+        for attempt in (
+            lambda: ws.get_all_values(value_render_option='FORMULA'),
+            lambda: ws.get_values(value_render_option='FORMULA'),
+            lambda: ws.get_all_values(),
+        ):
+            try:
+                grid = attempt()
+                if grid is not None:
+                    break
+            except Exception:
+                continue
+        if grid is None:
+            grid = ws.get_all_values()
+        if len(grid) < 2:
+            return [], "empty"
+        return grid, "ok"
+    except Exception as e:
+        logger.error(f"read_sheet_grid error: {e}")
+        return None, str(e)
+
 async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().replace("/","")
     try:
@@ -1073,8 +1113,12 @@ async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     net = total_profit - delivery
     salary = max(0, net) * SALARY_PCT / 100
 
-    # Build simple Excel from sheet rows
-    path = build_excel_from_rows(name, rows, month, delivery, total_revenue, total_profit, net, salary)
+    # Build Excel as a FAITHFUL COPY of the online sheet (formulas preserved)
+    grid, gstatus = read_sheet_grid_for_manager(name)
+    if gstatus != "ok" or not grid:
+        # резерв: если формулы не вытянулись — строим из числовых строк
+        grid = None
+    path = build_excel_from_grid(name, grid, rows, month, delivery)
 
     await update.message.reply_document(
         document=open(path,"rb"),
@@ -1093,142 +1137,217 @@ async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-def build_excel_from_rows(manager_name, rows, month, delivery, total_revenue, total_profit, net, salary):
-    """Build Excel report from Google Sheet rows.
+def build_excel_from_grid(manager_name, grid, rows, month, delivery):
+    """Build the report as a FAITHFUL COPY of the manager's online sheet.
 
-    ВСЕ вычисляемые поля и итоги пишутся ФОРМУЛАМИ Excel, а не готовыми числами.
-    Поэтому если поправить любой ввод (Кть, Закуп EUR, Мито%, Курс, Ціна, Прайс EUR
-    или Доставку) — себестоимость, выторг, прибуток S/T, чистий прибуток и ЗП
-    пересчитаются автоматически.
+    grid — полная сетка таблицы С ФОРМУЛАМИ (value_render_option='FORMULA'),
+    читается из Google Sheets. Мы переносим её в Excel 1:1: те же колонки,
+    те же номера строк — поэтому ссылки внутри формул остаются валидными,
+    а РУЧНЫЕ коэффициенты (*0.98*0.95 и т.п.), которые менеджер вписал в
+    онлайн-таблице, СОХРАНЯЮТСЯ как есть. Снизу дописывается блок ЗП.
 
-    Колонки:
-      A Клієнт  B Рахунок  C Дата  D Артикул
-      E Кть(in) F Закуп EUR(in) G Мито%(in) H Курс(in)
-      I Собів/шт = F*(1+G/100)*H      J Собів загал = I*E
-      K Ціна UAH(in)                  L Виторг = K*E
-      M Прайс EUR(in)
-      N Прибуток S   O Надбавка T   P Склад?
-    Логика S/T та сама, що в append_to_sheets:
-      склад:    N = L - M*H*E ;  O = (L - J) - N
-      не склад: N = L - J     ;  O = 0
+    Если grid недоступен (формулы не вытянулись) — резервный путь: строим из
+    числовых строк rows с собственными формулами бота.
+    """
+    if not grid or len(grid) < 2:
+        return _build_excel_from_numeric_rows(manager_name, rows, month, delivery)
+
+    # ── Колонки таблицы бота (1-based): денежные — форматируем как числа ──────
+    # A Менеджер B Клієнт C Рахунок D Дата E Артикул F Кть G Закуп EUR H Мито%
+    # I Курс J Собів/шт K Собів загал L Ціна M Виторг N Прибуток(S) O Надбавка(T)
+    # P Склад? Q УКТЗЕД R Бренд S Джерело T Прайс EUR U Вага/шт V/W Вага X Додано
+    NUMERIC_COLS = {6,7,8,9,10,11,12,13,14,15,20,21,22,23}
+    COL_ARTICLE = 5   # E
+    COL_STOCK = 16    # P
+    COL_S = 14        # N  Прибуток
+    COL_O = 15        # O  Надбавка
+    n_cols = max((len(r) for r in grid), default=24)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = month
+    thin = Side(style='thin', color='D5DBDB')
+    brd = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def conv(value, col_idx):
+        """Formula -> keep; numeric column -> float; else -> text."""
+        if value is None:
+            return None
+        s = str(value).strip()
+        if s == "":
+            return None
+        if s.startswith("="):
+            return s  # формула — сохраняем как есть
+        if col_idx in NUMERIC_COLS:
+            t = s.replace("\xa0", "").replace(" ", "").replace(",", ".")
+            try:
+                return float(t)
+            except:
+                return s
+        return s  # текст/код/дата — без изменений
+
+    # ── Переносим сетку 1:1 (строка таблицы i -> строка Excel i) ──────────────
+    for ri, srow in enumerate(grid, start=1):
+        is_header = (ri == 1)
+        article = str(srow[COL_ARTICLE - 1]).strip() if len(srow) >= COL_ARTICLE else ""
+        is_stock = (len(srow) >= COL_STOCK and str(srow[COL_STOCK - 1]).strip() == "так")
+        is_item = bool(article) and not is_header
+
+        for ci in range(1, n_cols + 1):
+            raw = srow[ci - 1] if ci - 1 < len(srow) else ""
+            cell = ws.cell(ri, ci, conv(raw, ci))
+            cell.border = brd
+            if is_header:
+                cell.font = Font(name='Arial', bold=True, size=8, color='FFFFFF')
+                cell.fill = PatternFill('solid', fgColor='2C3E50')
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            else:
+                cell.font = Font(name='Arial', size=9)
+                cell.alignment = Alignment(vertical='center')
+                if is_item:
+                    cell.fill = PatternFill('solid', fgColor='FDECEA' if is_stock else ('F8F9FA' if ri % 2 == 0 else 'FFFFFF'))
+                elif article == "" and any(str(x).strip() for x in srow):
+                    # строка-заголовок накладной (Клієнт/Рахунок/Дата)
+                    cell.fill = PatternFill('solid', fgColor='D6EAF8')
+                    cell.font = Font(name='Arial', bold=True, size=9)
+                if ci in NUMERIC_COLS:
+                    cell.number_format = '#,##0.00'
+        if is_header:
+            ws.row_dimensions[ri].height = 30
+
+    # ширина колонок
+    widths = [14,16,18,11,22,5,9,7,8,11,12,11,12,11,11,7,13,12,13,10,9,9,9,15]
+    for i in range(1, n_cols + 1):
+        w = widths[i - 1] if i - 1 < len(widths) else 11
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    last = len(grid)            # последняя строка данных
+    sN = get_column_letter(COL_S)   # N
+    sO = get_column_letter(COL_O)    # O
+
+    # ── Блок ЗП (формулами, доставка — редактируемая ячейка) ──────────────────
+    SR = last + 2
+    r_prof, r_deliv, r_net = SR, SR + 1, SR + 2
+    labels = [
+        ('Прибуток (S+T) грн:', f'=SUM({sN}2:{sN}{last})+SUM({sO}2:{sO}{last})'),
+        ('▶ Доставка грн (можна редагувати):', round(delivery, 2)),
+        ('Чистий прибуток грн:', f'=D{r_prof}-D{r_deliv}'),
+        (f'ЗП ({SALARY_PCT}%) грн:', f'=MAX(0,D{r_net})*{SALARY_PCT}/100'),
+    ]
+    for i, (lbl, val) in enumerate(labels):
+        r2 = SR + i
+        ws.merge_cells(f'A{r2}:C{r2}')
+        ws.cell(r2, 1, lbl).font = Font(name='Arial', size=10, bold=True)
+        ws.cell(r2, 1).alignment = Alignment(horizontal='right')
+        cv = ws.cell(r2, 4, val)
+        cv.number_format = '#,##0.00'
+        if i == 1:
+            cv.fill = PatternFill('solid', fgColor='EBF5FB')
+            cv.font = Font(name='Arial', size=11, color='000080', bold=True)
+        elif i == 3:
+            cv.fill = PatternFill('solid', fgColor='D5F5E3')
+            cv.font = Font(name='Arial', size=14, color='1E8449', bold=True)
+
+    ws.freeze_panes = "A2"
+    path = str(DATA_DIR / f"salary_{manager_name}_{month}.xlsx")
+    wb.save(path)
+    return path
+
+
+def _build_excel_from_numeric_rows(manager_name, rows, month, delivery):
+    """Резерв: формулы из Google Sheets не вытянулись — строим из чисел.
+
+    Здесь профит пересчитывается стандартной формулой бота (БЕЗ ручных
+    коэффициентов), поэтому используется только когда основной путь недоступен.
     """
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = month
     thin = Side(style='thin', color='BDC3C7')
-    brd = Border(left=thin,right=thin,top=thin,bottom=thin)
+    brd = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     ws.merge_cells('A1:P1')
-    ws['A1'] = f'РОЗРАХУНОК ЗП — {manager_name} — {month}'
-    ws['A1'].font = Font(name='Arial',bold=True,size=13,color='FFFFFF')
-    ws['A1'].fill = PatternFill('solid',fgColor='1F2D3D')
-    ws['A1'].alignment = Alignment(horizontal='center',vertical='center')
-    ws.row_dimensions[1].height = 26
+    ws['A1'] = f'РОЗРАХУНОК ЗП — {manager_name} — {month} (резерв, без ручних коеф.)'
+    ws['A1'].font = Font(name='Arial', bold=True, size=12, color='FFFFFF')
+    ws['A1'].fill = PatternFill('solid', fgColor='922B21')
+    ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
+    ws.row_dimensions[1].height = 24
 
     headers = ['Клієнт','Рахунок','Дата','Артикул','Кть','Закуп EUR','Мито%','Курс',
                'Собів/шт','Собів загал','Ціна UAH','Виторг','Прайс EUR',
                'Прибуток S','Надбавка T','Склад?']
-    ws.row_dimensions[2].height = 32
-    for c,h in enumerate(headers,1):
-        cell = ws.cell(2,c,h)
-        cell.font = Font(name='Arial',bold=True,size=8,color='FFFFFF')
-        cell.fill = PatternFill('solid',fgColor='2C3E50')
-        cell.alignment = Alignment(horizontal='center',vertical='center',wrap_text=True)
+    for c, h in enumerate(headers, 1):
+        cell = ws.cell(2, c, h)
+        cell.font = Font(name='Arial', bold=True, size=8, color='FFFFFF')
+        cell.fill = PatternFill('solid', fgColor='2C3E50')
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
         cell.border = brd
-    for i,w in enumerate([16,18,11,20,5,10,7,9,11,12,11,12,10,12,12,7],1):
+    for i, w in enumerate([16,18,11,20,5,10,7,9,11,12,11,12,10,12,12,7], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     def num(v):
         try: return float(str(v).replace("\xa0","").replace(" ","").replace(",","."))
         except: return 0.0
 
-    # Колонки, которые должны быть в денежном формате
     money_cols = [6,7,8,9,10,11,12,13,14,15]
-
     row = 3
     for r in rows:
         is_stock = (len(r) > 15 and r[15] == "так")
         price_eur = num(r[19]) if len(r) > 19 else 0.0
-
         if is_stock:
             f_s = f"=L{row}-M{row}*H{row}*E{row}"
             f_t = f"=(L{row}-J{row})-N{row}"
         else:
             f_s = f"=L{row}-J{row}"
             f_t = 0
-
-        vals = [
-            r[1],                                   # A Клієнт
-            r[2],                                   # B Рахунок
-            r[3],                                   # C Дата
-            r[4],                                   # D Артикул
-            num(r[5]),                              # E Кть          (ввод)
-            num(r[6]),                              # F Закуп EUR    (ввод)
-            num(r[7]),                              # G Мито%        (ввод)
-            num(r[8]),                              # H Курс         (ввод)
-            f"=F{row}*(1+G{row}/100)*H{row}",       # I Собів/шт     (формула)
-            f"=I{row}*E{row}",                      # J Собів загал  (формула)
-            num(r[11]),                             # K Ціна UAH     (ввод)
-            f"=K{row}*E{row}",                      # L Виторг       (формула)
-            price_eur,                              # M Прайс EUR    (ввод)
-            f_s,                                    # N Прибуток S   (формула)
-            f_t,                                    # O Надбавка T   (формула / 0)
-            "так" if is_stock else "",              # P Склад?
-        ]
-        for c,v in enumerate(vals,1):
-            cell = ws.cell(row,c,v)
-            cell.font = Font(name='Arial',size=9)
+        vals = [r[1], r[2], r[3], r[4], num(r[5]), num(r[6]), num(r[7]), num(r[8]),
+                f"=F{row}*(1+G{row}/100)*H{row}", f"=I{row}*E{row}", num(r[11]),
+                f"=K{row}*E{row}", price_eur, f_s, f_t, "так" if is_stock else ""]
+        for c, v in enumerate(vals, 1):
+            cell = ws.cell(row, c, v)
+            cell.font = Font(name='Arial', size=9)
             cell.border = brd
             cell.alignment = Alignment(vertical='center')
             if c in money_cols:
                 cell.number_format = '#,##0.00'
-            cell.fill = PatternFill('solid',fgColor='FDECEA' if is_stock else ('F8F9FA' if row%2==0 else 'FFFFFF'))
+            cell.fill = PatternFill('solid', fgColor='FDECEA' if is_stock else ('F8F9FA' if row % 2 == 0 else 'FFFFFF'))
         row += 1
 
-    last = row - 1  # последняя строка с данными
+    last = row - 1
     TOT = row
     ws.merge_cells(f'A{TOT}:K{TOT}')
-    ws.cell(TOT,1,'ПІДСУМОК').font = Font(name='Arial',bold=True,size=10,color='FFFFFF')
-    ws.cell(TOT,1).fill = PatternFill('solid',fgColor='1A5276')
-    ws.cell(TOT,1).alignment = Alignment(horizontal='right')
-    # Суммы по Виторг(L), Прибуток S(N), Надбавка T(O) — формулами
-    for c in [12,14,15]:
+    ws.cell(TOT, 1, 'ПІДСУМОК').font = Font(name='Arial', bold=True, size=10, color='FFFFFF')
+    ws.cell(TOT, 1).fill = PatternFill('solid', fgColor='1A5276')
+    ws.cell(TOT, 1).alignment = Alignment(horizontal='right')
+    for c in [12, 14, 15]:
         cl = get_column_letter(c)
-        formula = f'=SUM({cl}3:{cl}{last})' if last >= 3 else 0
-        cell = ws.cell(TOT,c,formula)
-        cell.font = Font(name='Arial',bold=True,size=10,color='FFFFFF')
-        cell.fill = PatternFill('solid',fgColor='1A5276')
+        cell = ws.cell(TOT, c, f'=SUM({cl}3:{cl}{last})' if last >= 3 else 0)
+        cell.font = Font(name='Arial', bold=True, size=10, color='FFFFFF')
+        cell.fill = PatternFill('solid', fgColor='1A5276')
         cell.number_format = '#,##0.00'
         cell.border = brd
 
-    # ── Итоговый блок (всё формулами, доставка — редактируемый ввод) ──────────
     SR = TOT + 2
-    r_prof = SR        # Прибуток (S+T)
-    r_deliv = SR + 1   # Доставка (ввод)
-    r_net = SR + 2     # Чистий прибуток
-    r_zp = SR + 3      # ЗП
-
-    labels = [
-        ('Прибуток (S+T) грн:', f'=N{TOT}+O{TOT}'),
-        ('▶ Доставка грн (можна редагувати):', round(delivery, 2)),
-        ('Чистий прибуток грн:', f'=D{r_prof}-D{r_deliv}'),
-        (f'ЗП ({SALARY_PCT}%) грн:', f'=MAX(0,D{r_net})*{SALARY_PCT}/100'),
-    ]
-    for i,(lbl,val) in enumerate(labels):
+    r_prof, r_deliv, r_net = SR, SR + 1, SR + 2
+    labels = [('Прибуток (S+T) грн:', f'=N{TOT}+O{TOT}'),
+              ('▶ Доставка грн (можна редагувати):', round(delivery, 2)),
+              ('Чистий прибуток грн:', f'=D{r_prof}-D{r_deliv}'),
+              (f'ЗП ({SALARY_PCT}%) грн:', f'=MAX(0,D{r_net})*{SALARY_PCT}/100')]
+    for i, (lbl, val) in enumerate(labels):
         r2 = SR + i
         ws.merge_cells(f'A{r2}:C{r2}')
-        ws.cell(r2,1,lbl).font = Font(name='Arial',size=10,bold=True)
-        ws.cell(r2,1).alignment = Alignment(horizontal='right')
-        cv = ws.cell(r2,4,val)
+        ws.cell(r2, 1, lbl).font = Font(name='Arial', size=10, bold=True)
+        ws.cell(r2, 1).alignment = Alignment(horizontal='right')
+        cv = ws.cell(r2, 4, val)
         cv.number_format = '#,##0.00'
-        if i == 1:  # доставка — подсветить как поле ввода
-            cv.fill = PatternFill('solid',fgColor='EBF5FB')
-            cv.font = Font(name='Arial',size=11,color='000080',bold=True)
-        elif i == 3:  # ЗП — итог
-            cv.fill = PatternFill('solid',fgColor='D5F5E3')
-            cv.font = Font(name='Arial',size=14,color='1E8449',bold=True)
+        if i == 1:
+            cv.fill = PatternFill('solid', fgColor='EBF5FB')
+            cv.font = Font(name='Arial', size=11, color='000080', bold=True)
+        elif i == 3:
+            cv.fill = PatternFill('solid', fgColor='D5F5E3')
+            cv.font = Font(name='Arial', size=14, color='1E8449', bold=True)
 
-    path = str(DATA_DIR/f"salary_{manager_name}_{month}.xlsx")
+    path = str(DATA_DIR / f"salary_{manager_name}_{month}.xlsx")
     wb.save(path)
     return path
 
