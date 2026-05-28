@@ -645,8 +645,11 @@ def build_excel(manager_name, invoices, month):
 
     row = 3
     for inv in invoices:
+        import re as re_b
+        m_b = re_b.search(r"[№#No]+\s*(\d+)", inv.get("invoice_num",""))
+        inv_num_b = m_b.group(1) if m_b else ""
         for item in inv.get("items",[]):
-            lu = lookup_article(item["article"], inv_number, item.get("is_stock", False))
+            lu = lookup_article(item["article"], inv_num_b, item.get("is_stock", False))
             cost_eur = lu.get("cost_eur",0)
             duty = lu.get("duty",0.04)
             rate = item.get("rate", inv.get("rate",52.0))
@@ -997,13 +1000,36 @@ async def save_invoice(query, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user = load_user(uid)
-    if not user.get("invoices"):
-        await update.message.reply_text("📭 Немає рахунків цього місяця.")
-        return
     await update.message.reply_text("Введи витрати на доставку (грн) або /0 якщо немає:")
     return WAIT_DELIVERY
+
+def read_sheet_rows_for_manager(manager_name: str):
+    """Read all data rows from manager's Google Sheet for current month."""
+    try:
+        sh = get_gsheet()
+        if not sh:
+            return None, "no_connection"
+        try:
+            ws = sh.worksheet(manager_name)
+        except gspread.WorksheetNotFound:
+            return [], "no_sheet"
+        all_vals = ws.get_all_values()
+        if len(all_vals) < 2:
+            return [], "empty"
+        # Columns: A..X (0..23). Data rows have article in col E (idx 4)
+        # Skip header (row 1), separator rows (empty), and invoice-title rows (no article)
+        rows = []
+        for r in all_vals[1:]:
+            if len(r) < 24:
+                continue
+            article = r[4].strip()
+            if not article:
+                continue  # separator or title row
+            rows.append(r)
+        return rows, "ok"
+    except Exception as e:
+        logger.error(f"read_sheet error: {e}")
+        return None, str(e)
 
 async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().replace("/","")
@@ -1014,43 +1040,136 @@ async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     uid = update.effective_user.id
     user = load_user(uid)
-    invoices = user.get("invoices",[])
     name = user.get("name", str(uid))
     month = datetime.now().strftime("%m.%Y")
 
-    total_profit = 0
-    total_revenue = 0
-    for inv in invoices:
-        for item in inv.get("items",[]):
-            lu = lookup_article(item["article"], inv_number, item.get("is_stock", False))
-            cost_eur = lu.get("cost_eur",0)
-            duty = lu.get("duty",0.04)
-            rate = item.get("rate", inv.get("rate",52.0))
-            cost_uah = cost_eur*(1+duty)*rate*item["qty"]
-            revenue = item["price_uah"]*item["qty"]
-            profit = (item["price_uah"]-cost_eur*(1+duty)*rate)*item["qty"] if item.get("is_stock") else revenue-cost_uah
-            total_profit += profit
-            total_revenue += revenue
+    # Read straight from Google Sheets (survives restarts)
+    rows, status = read_sheet_rows_for_manager(name)
+
+    if status == "no_connection":
+        await update.message.reply_text("⚠️ Google Sheets недоступний. Спробуй пізніше.")
+        return ConversationHandler.END
+    if status in ("no_sheet", "empty") or not rows:
+        await update.message.reply_text("📭 Немає рахунків цього місяця в таблиці.")
+        return ConversationHandler.END
+
+    # Sum profit from columns N (Прибуток S, idx 13) + O (Надбавка T, idx 14)
+    # and revenue from M (Виторг, idx 12)
+    def num(v):
+        try:
+            return float(str(v).replace("\xa0","").replace(" ","").replace(",","."))
+        except:
+            return 0.0
+
+    total_revenue = 0.0
+    total_profit = 0.0
+    for r in rows:
+        revenue = num(r[12])          # M Виторг
+        s_val = num(r[13])            # N Прибуток (S)
+        t_val = num(r[14])            # O Надбавка (T)
+        total_revenue += revenue
+        total_profit += (s_val + t_val)
 
     net = total_profit - delivery
     salary = max(0, net) * SALARY_PCT / 100
 
-    path = build_excel(name, invoices, month)
+    # Build simple Excel from sheet rows
+    path = build_excel_from_rows(name, rows, month, delivery, total_revenue, total_profit, net, salary)
+
     await update.message.reply_document(
         document=open(path,"rb"),
         filename=f"ЗП_{name}_{month}.xlsx",
         caption=(
             f"📊 *Звіт за {month}*\n\n"
+            f"Позицій: {len(rows)}\n"
             f"Виторг: *{total_revenue:,.0f} грн*\n"
-            f"Прибуток: *{total_profit:,.0f} грн*\n"
+            f"Прибуток (S+T): *{total_profit:,.0f} грн*\n"
             f"Доставка: *{delivery:,.0f} грн*\n"
-            f"Чистий прибуток: *{net:,.0f} грн*\n"
+            f"Чистий: *{net:,.0f} грн*\n"
             f"━━━━━━━━━━━━\n"
-            f"💰 *ЗП: {salary:,.0f} грн*"
+            f"💰 *ЗП ({SALARY_PCT}%): {salary:,.0f} грн*"
         ),
         parse_mode="Markdown"
     )
     return ConversationHandler.END
+
+def build_excel_from_rows(manager_name, rows, month, delivery, total_revenue, total_profit, net, salary):
+    """Build Excel report from Google Sheet rows."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = month
+    thin = Side(style='thin', color='BDC3C7')
+    brd = Border(left=thin,right=thin,top=thin,bottom=thin)
+
+    ws.merge_cells('A1:N1')
+    ws['A1'] = f'РОЗРАХУНОК ЗП — {manager_name} — {month}'
+    ws['A1'].font = Font(name='Arial',bold=True,size=13,color='FFFFFF')
+    ws['A1'].fill = PatternFill('solid',fgColor='1F2D3D')
+    ws['A1'].alignment = Alignment(horizontal='center',vertical='center')
+    ws.row_dimensions[1].height = 26
+
+    headers = ['Клієнт','Рахунок','Дата','Артикул','Кть','Закуп EUR','Курс',
+               'Ціна UAH','Виторг','Прибуток S','Надбавка T','Склад?']
+    ws.row_dimensions[2].height = 30
+    for c,h in enumerate(headers,1):
+        cell = ws.cell(2,c,h)
+        cell.font = Font(name='Arial',bold=True,size=9,color='FFFFFF')
+        cell.fill = PatternFill('solid',fgColor='2C3E50')
+        cell.alignment = Alignment(horizontal='center',vertical='center',wrap_text=True)
+        cell.border = brd
+    for i,w in enumerate([18,20,11,22,5,10,8,12,13,13,13,8],1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    def num(v):
+        try: return float(str(v).replace("\xa0","").replace(" ","").replace(",","."))
+        except: return 0.0
+
+    row = 3
+    for r in rows:
+        is_stock = (len(r) > 15 and r[15] == "так")
+        vals = [r[1], r[2], r[3], r[4], num(r[5]), num(r[6]), num(r[8]),
+                num(r[11]), num(r[12]), num(r[13]), num(r[14]),
+                "так" if is_stock else ""]
+        for c,v in enumerate(vals,1):
+            cell = ws.cell(row,c,v)
+            cell.font = Font(name='Arial',size=9)
+            cell.border = brd
+            if c in [5,6,7,8,9,10,11]:
+                cell.number_format = '#,##0.00'
+            cell.fill = PatternFill('solid',fgColor='FDECEA' if is_stock else ('F8F9FA' if row%2==0 else 'FFFFFF'))
+        row += 1
+
+    TOT = row
+    ws.merge_cells(f'A{TOT}:H{TOT}')
+    ws.cell(TOT,1,'ПІДСУМОК').font = Font(name='Arial',bold=True,size=10,color='FFFFFF')
+    ws.cell(TOT,1).fill = PatternFill('solid',fgColor='1A5276')
+    ws.cell(TOT,1).alignment = Alignment(horizontal='right')
+    for c in [9,10,11]:
+        cl = get_column_letter(c)
+        cell = ws.cell(TOT,c,f'=SUM({cl}3:{cl}{TOT-1})')
+        cell.font = Font(name='Arial',bold=True,size=10,color='FFFFFF')
+        cell.fill = PatternFill('solid',fgColor='1A5276')
+        cell.number_format = '#,##0.00'
+
+    SR = TOT+2
+    labels = [('Прибуток (S+T) грн:', total_profit),
+              ('Доставка грн:', delivery),
+              ('Чистий прибуток грн:', net),
+              (f'ЗП ({SALARY_PCT}%) грн:', salary)]
+    for i,(lbl,val) in enumerate(labels):
+        r2=SR+i
+        ws.merge_cells(f'A{r2}:C{r2}')
+        ws.cell(r2,1,lbl).font=Font(name='Arial',size=10,bold=True)
+        ws.cell(r2,1).alignment=Alignment(horizontal='right')
+        cv=ws.cell(r2,4,round(val,2))
+        cv.number_format='#,##0.00'
+        if i==3:
+            cv.fill=PatternFill('solid',fgColor='D5F5E3')
+            cv.font=Font(name='Arial',size=14,color='1E8449',bold=True)
+
+    path = str(DATA_DIR/f"salary_{manager_name}_{month}.xlsx")
+    wb.save(path)
+    return path
 
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("✅ Так",callback_data="clear_yes"),
@@ -1081,8 +1200,11 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             invoices = data.get("invoices",[])
             profit = 0
             for inv in invoices:
+                import re as re_a
+                m_a = re_a.search(r"[№#No]+\s*(\d+)", inv.get("invoice_num",""))
+                inv_num_a = m_a.group(1) if m_a else ""
                 for item in inv.get("items",[]):
-                    lu = lookup_article(item["article"], inv_number, item.get("is_stock", False))
+                    lu = lookup_article(item["article"], inv_num_a, item.get("is_stock", False))
                     cost_eur = lu.get("cost_eur",0)
                     duty = lu.get("duty",0.04)
                     rate = item.get("rate",52.0)
