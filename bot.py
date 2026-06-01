@@ -62,9 +62,85 @@ try:
 except:
     RATES: dict = {}
 
+# Actual client payment dates from the Teams chat: invoice_num -> "DD.MM.YYYY"
+try:
+    with open("payment_dates.json", encoding="utf-8") as f:
+        PAYMENT_DATES: dict = json.load(f)
+except:
+    PAYMENT_DATES: dict = {}
+
 def get_rate_from_archive(date_str: str) -> float:
     """Get EUR buy rate from local archive, return 0 if not found"""
     return float(RATES.get(date_str, 0))
+
+def _parse_ddmmyyyy(s):
+    """Parse 'DD.MM.YYYY' -> datetime, or None."""
+    try:
+        return datetime.strptime(str(s).strip(), "%d.%m.%Y")
+    except Exception:
+        return None
+
+def earliest_date(dates) -> str:
+    """Return the earliest valid 'DD.MM.YYYY' from the list, else ''.
+    Double-check rule: take whichever payment event came first."""
+    parsed = [(d, _parse_ddmmyyyy(d)) for d in dates if d]
+    parsed = [(d, p) for d, p in parsed if p]
+    if not parsed:
+        return ""
+    return min(parsed, key=lambda x: x[1])[0]
+
+def get_payment_date(invoice_num: str) -> str:
+    """Actual payment date for an invoice number, from the Teams payments file."""
+    if not invoice_num:
+        return ""
+    return PAYMENT_DATES.get(str(invoice_num).strip(), "")
+
+def parse_payments_text(text: str) -> dict:
+    """Parse Teams-style payment messages into {invoice_num: 'DD.MM.YYYY'}.
+
+    Format (as posted in Teams):
+        Оплати за 29/05/26 «...»
+        1. КЛІЄНТ рах.834 – 64 531,20
+        2. КЛІЄНТ рах.835 – 33 799,20
+    A line mentioning 'оплат' + a date sets the current date; every following
+    'рах.NNN' line inherits it. Several day-blocks can follow one another.
+    """
+    result = {}
+    current_date = ""
+    date_re = re.compile(r'(\d{1,2})[./](\d{1,2})[./](\d{2,4})')
+    rah_re = re.compile(r'рах\.?\s*№?\s*(\d+)', re.IGNORECASE)
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if 'оплат' in line.lower():
+            m = date_re.search(line)
+            if m:
+                dd, mm, yy = m.group(1), m.group(2), m.group(3)
+                year = int(yy)
+                if year < 100:
+                    year += 2000
+                try:
+                    current_date = f"{int(dd):02d}.{int(mm):02d}.{year}"
+                except Exception:
+                    pass
+                continue
+        mi = rah_re.search(line)
+        if mi and current_date:
+            result[mi.group(1)] = current_date
+    return result
+
+def _merge_payment_dates(new_dates: dict) -> None:
+    """Merge parsed dates into PAYMENT_DATES (keeping earliest on conflict)
+    and persist to payment_dates.json."""
+    for inv, d in new_dates.items():
+        old = PAYMENT_DATES.get(inv, "")
+        PAYMENT_DATES[inv] = earliest_date([old, d]) or d
+    try:
+        with open("payment_dates.json", "w", encoding="utf-8") as f:
+            json.dump(PAYMENT_DATES, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"payment_dates save error: {e}")
 
 def get_price(art: str) -> float:
     return PRICE_LOOKUP.get(art, 0)
@@ -718,7 +794,7 @@ def build_excel(manager_name, invoices, month):
     return path
 
 # ── States ────────────────────────────────────────────────────────────────────
-WAIT_NAME, WAIT_DATE, WAIT_STOCK, WAIT_DELIVERY, WAIT_EXCEL, WAIT_RATES = range(6)
+WAIT_NAME, WAIT_DATE, WAIT_STOCK, WAIT_DELIVERY, WAIT_EXCEL, WAIT_RATES, WAIT_PAYMENTS = range(7)
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -808,9 +884,11 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"⚠️ Не знайдено ({len(not_found)}): {', '.join(not_found)}")
 
     # ── Date & rate logic ────────────────────────────────────────────────────
-    # Find date ONLY from invoice-specific records (matching THIS invoice number)
-    # Stock items from general lookup don't count - we need explicit confirmation
-    auto_date = ""
+    # Two possible date sources for this invoice:
+    #   1) confirm_date from the orders table (invoice_lookup, via /update)
+    #   2) actual client payment date from the Teams payments file (/oplata)
+    # Double-check rule: use whichever event came FIRST (the earliest date).
+    confirm_date = ""
     if inv_number:
         for item in parsed["items"]:
             inv_key = f"{inv_number}:{item['article']}"
@@ -818,8 +896,15 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 rec = INVOICE_LOOKUP[inv_key]
                 d = rec.get("confirm_date", "")
                 if d:
-                    auto_date = d
+                    confirm_date = d
                     break
+
+    payment_date = get_payment_date(inv_number)
+    auto_date = earliest_date([confirm_date, payment_date])
+    # Show a note when the two sources disagree so the manager sees the check fired
+    date_note = ""
+    if confirm_date and payment_date and confirm_date != payment_date:
+        date_note = f" _(найраніша з: таблиця {confirm_date} / оплата {payment_date})_"
 
     items = ctx.user_data["pending_invoice"].get("items", [])
     ctx.user_data["stock_selected"] = set()
@@ -832,11 +917,11 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data["pending_invoice"]["date"] = auto_date
             for item in ctx.user_data["pending_invoice"]["items"]:
                 item["rate"] = rate
-            lines.append(f"\n💱 Дата: *{auto_date}* | Курс: *{rate:.2f} грн/EUR* (+{RATE_MARKUP}%)")
+            lines.append(f"\n💱 Дата: *{auto_date}* | Курс: *{rate:.2f} грн/EUR* (+{RATE_MARKUP}%){date_note}")
         else:
             ctx.user_data["pending_invoice"]["rate"] = 0
             ctx.user_data["pending_invoice"]["date"] = auto_date
-            lines.append(f"\n💱 Дата: *{auto_date}* | ⚠️ Курс не знайдено — вкажи вручну в таблиці")
+            lines.append(f"\n💱 Дата: *{auto_date}* | ⚠️ Курс не знайдено — вкажи вручну в таблиці{date_note}")
 
         await msg.edit_text("\n".join(lines), parse_mode="Markdown")
         await msg.reply_text(
@@ -1031,46 +1116,6 @@ def read_sheet_rows_for_manager(manager_name: str):
         logger.error(f"read_sheet error: {e}")
         return None, str(e)
 
-def read_sheet_grid_for_manager(manager_name: str):
-    """Read the FULL grid for a manager WITH FORMULAS preserved.
-
-    get_all_values() возвращает посчитанные числа; здесь мы запрашиваем
-    value_render_option='FORMULA', чтобы в ячейках остались сами формулы
-    (включая ручные коэффициенты типа *0.98*0.95, которые менеджер вписал
-    в онлайн-таблицу). Колонки и номера строк остаются как в таблице —
-    значит ссылки внутри формул остаются валидными при копировании 1:1.
-    Возвращает (grid, status), где grid — список строк (list[str]).
-    """
-    try:
-        sh = get_gsheet()
-        if not sh:
-            return None, "no_connection"
-        try:
-            ws = sh.worksheet(manager_name)
-        except gspread.WorksheetNotFound:
-            return [], "no_sheet"
-        grid = None
-        # пытаемся вытащить формулы (разные версии gspread по-разному)
-        for attempt in (
-            lambda: ws.get_all_values(value_render_option='FORMULA'),
-            lambda: ws.get_values(value_render_option='FORMULA'),
-            lambda: ws.get_all_values(),
-        ):
-            try:
-                grid = attempt()
-                if grid is not None:
-                    break
-            except Exception:
-                continue
-        if grid is None:
-            grid = ws.get_all_values()
-        if len(grid) < 2:
-            return [], "empty"
-        return grid, "ok"
-    except Exception as e:
-        logger.error(f"read_sheet_grid error: {e}")
-        return None, str(e)
-
 async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().replace("/","")
     try:
@@ -1113,12 +1158,8 @@ async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     net = total_profit - delivery
     salary = max(0, net) * SALARY_PCT / 100
 
-    # Build Excel as a FAITHFUL COPY of the online sheet (formulas preserved)
-    grid, gstatus = read_sheet_grid_for_manager(name)
-    if gstatus != "ok" or not grid:
-        # резерв: если формулы не вытянулись — строим из числовых строк
-        grid = None
-    path = build_excel_from_grid(name, grid, rows, month, delivery)
+    # Build simple Excel from sheet rows
+    path = build_excel_from_rows(name, rows, month, delivery, total_revenue, total_profit, net, salary)
 
     await update.message.reply_document(
         document=open(path,"rb"),
@@ -1137,217 +1178,81 @@ async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-def build_excel_from_grid(manager_name, grid, rows, month, delivery):
-    """Build the report as a FAITHFUL COPY of the manager's online sheet.
-
-    grid — полная сетка таблицы С ФОРМУЛАМИ (value_render_option='FORMULA'),
-    читается из Google Sheets. Мы переносим её в Excel 1:1: те же колонки,
-    те же номера строк — поэтому ссылки внутри формул остаются валидными,
-    а РУЧНЫЕ коэффициенты (*0.98*0.95 и т.п.), которые менеджер вписал в
-    онлайн-таблице, СОХРАНЯЮТСЯ как есть. Снизу дописывается блок ЗП.
-
-    Если grid недоступен (формулы не вытянулись) — резервный путь: строим из
-    числовых строк rows с собственными формулами бота.
-    """
-    if not grid or len(grid) < 2:
-        return _build_excel_from_numeric_rows(manager_name, rows, month, delivery)
-
-    # ── Колонки таблицы бота (1-based): денежные — форматируем как числа ──────
-    # A Менеджер B Клієнт C Рахунок D Дата E Артикул F Кть G Закуп EUR H Мито%
-    # I Курс J Собів/шт K Собів загал L Ціна M Виторг N Прибуток(S) O Надбавка(T)
-    # P Склад? Q УКТЗЕД R Бренд S Джерело T Прайс EUR U Вага/шт V/W Вага X Додано
-    NUMERIC_COLS = {6,7,8,9,10,11,12,13,14,15,20,21,22,23}
-    COL_ARTICLE = 5   # E
-    COL_STOCK = 16    # P
-    COL_S = 14        # N  Прибуток
-    COL_O = 15        # O  Надбавка
-    n_cols = max((len(r) for r in grid), default=24)
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = month
-    thin = Side(style='thin', color='D5DBDB')
-    brd = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    def conv(value, col_idx):
-        """Formula -> keep; numeric column -> float; else -> text."""
-        if value is None:
-            return None
-        s = str(value).strip()
-        if s == "":
-            return None
-        if s.startswith("="):
-            return s  # формула — сохраняем как есть
-        if col_idx in NUMERIC_COLS:
-            t = s.replace("\xa0", "").replace(" ", "").replace(",", ".")
-            try:
-                return float(t)
-            except:
-                return s
-        return s  # текст/код/дата — без изменений
-
-    # ── Переносим сетку 1:1 (строка таблицы i -> строка Excel i) ──────────────
-    for ri, srow in enumerate(grid, start=1):
-        is_header = (ri == 1)
-        article = str(srow[COL_ARTICLE - 1]).strip() if len(srow) >= COL_ARTICLE else ""
-        is_stock = (len(srow) >= COL_STOCK and str(srow[COL_STOCK - 1]).strip() == "так")
-        is_item = bool(article) and not is_header
-
-        for ci in range(1, n_cols + 1):
-            raw = srow[ci - 1] if ci - 1 < len(srow) else ""
-            cell = ws.cell(ri, ci, conv(raw, ci))
-            cell.border = brd
-            if is_header:
-                cell.font = Font(name='Arial', bold=True, size=8, color='FFFFFF')
-                cell.fill = PatternFill('solid', fgColor='2C3E50')
-                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-            else:
-                cell.font = Font(name='Arial', size=9)
-                cell.alignment = Alignment(vertical='center')
-                if is_item:
-                    cell.fill = PatternFill('solid', fgColor='FDECEA' if is_stock else ('F8F9FA' if ri % 2 == 0 else 'FFFFFF'))
-                elif article == "" and any(str(x).strip() for x in srow):
-                    # строка-заголовок накладной (Клієнт/Рахунок/Дата)
-                    cell.fill = PatternFill('solid', fgColor='D6EAF8')
-                    cell.font = Font(name='Arial', bold=True, size=9)
-                if ci in NUMERIC_COLS:
-                    cell.number_format = '#,##0.00'
-        if is_header:
-            ws.row_dimensions[ri].height = 30
-
-    # ширина колонок
-    widths = [14,16,18,11,22,5,9,7,8,11,12,11,12,11,11,7,13,12,13,10,9,9,9,15]
-    for i in range(1, n_cols + 1):
-        w = widths[i - 1] if i - 1 < len(widths) else 11
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-    last = len(grid)            # последняя строка данных
-    sN = get_column_letter(COL_S)   # N
-    sO = get_column_letter(COL_O)    # O
-
-    # ── Блок ЗП (формулами, доставка — редактируемая ячейка) ──────────────────
-    SR = last + 2
-    r_prof, r_deliv, r_net = SR, SR + 1, SR + 2
-    labels = [
-        ('Прибуток (S+T) грн:', f'=SUM({sN}2:{sN}{last})+SUM({sO}2:{sO}{last})'),
-        ('▶ Доставка грн (можна редагувати):', round(delivery, 2)),
-        ('Чистий прибуток грн:', f'=D{r_prof}-D{r_deliv}'),
-        (f'ЗП ({SALARY_PCT}%) грн:', f'=MAX(0,D{r_net})*{SALARY_PCT}/100'),
-    ]
-    for i, (lbl, val) in enumerate(labels):
-        r2 = SR + i
-        ws.merge_cells(f'A{r2}:C{r2}')
-        ws.cell(r2, 1, lbl).font = Font(name='Arial', size=10, bold=True)
-        ws.cell(r2, 1).alignment = Alignment(horizontal='right')
-        cv = ws.cell(r2, 4, val)
-        cv.number_format = '#,##0.00'
-        if i == 1:
-            cv.fill = PatternFill('solid', fgColor='EBF5FB')
-            cv.font = Font(name='Arial', size=11, color='000080', bold=True)
-        elif i == 3:
-            cv.fill = PatternFill('solid', fgColor='D5F5E3')
-            cv.font = Font(name='Arial', size=14, color='1E8449', bold=True)
-
-    ws.freeze_panes = "A2"
-    path = str(DATA_DIR / f"salary_{manager_name}_{month}.xlsx")
-    wb.save(path)
-    return path
-
-
-def _build_excel_from_numeric_rows(manager_name, rows, month, delivery):
-    """Резерв: формулы из Google Sheets не вытянулись — строим из чисел.
-
-    Здесь профит пересчитывается стандартной формулой бота (БЕЗ ручных
-    коэффициентов), поэтому используется только когда основной путь недоступен.
-    """
+def build_excel_from_rows(manager_name, rows, month, delivery, total_revenue, total_profit, net, salary):
+    """Build Excel report from Google Sheet rows."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = month
     thin = Side(style='thin', color='BDC3C7')
-    brd = Border(left=thin, right=thin, top=thin, bottom=thin)
+    brd = Border(left=thin,right=thin,top=thin,bottom=thin)
 
-    ws.merge_cells('A1:P1')
-    ws['A1'] = f'РОЗРАХУНОК ЗП — {manager_name} — {month} (резерв, без ручних коеф.)'
-    ws['A1'].font = Font(name='Arial', bold=True, size=12, color='FFFFFF')
-    ws['A1'].fill = PatternFill('solid', fgColor='922B21')
-    ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
-    ws.row_dimensions[1].height = 24
+    ws.merge_cells('A1:N1')
+    ws['A1'] = f'РОЗРАХУНОК ЗП — {manager_name} — {month}'
+    ws['A1'].font = Font(name='Arial',bold=True,size=13,color='FFFFFF')
+    ws['A1'].fill = PatternFill('solid',fgColor='1F2D3D')
+    ws['A1'].alignment = Alignment(horizontal='center',vertical='center')
+    ws.row_dimensions[1].height = 26
 
-    headers = ['Клієнт','Рахунок','Дата','Артикул','Кть','Закуп EUR','Мито%','Курс',
-               'Собів/шт','Собів загал','Ціна UAH','Виторг','Прайс EUR',
-               'Прибуток S','Надбавка T','Склад?']
-    for c, h in enumerate(headers, 1):
-        cell = ws.cell(2, c, h)
-        cell.font = Font(name='Arial', bold=True, size=8, color='FFFFFF')
-        cell.fill = PatternFill('solid', fgColor='2C3E50')
-        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    headers = ['Клієнт','Рахунок','Дата','Артикул','Кть','Закуп EUR','Курс',
+               'Ціна UAH','Виторг','Прибуток S','Надбавка T','Склад?']
+    ws.row_dimensions[2].height = 30
+    for c,h in enumerate(headers,1):
+        cell = ws.cell(2,c,h)
+        cell.font = Font(name='Arial',bold=True,size=9,color='FFFFFF')
+        cell.fill = PatternFill('solid',fgColor='2C3E50')
+        cell.alignment = Alignment(horizontal='center',vertical='center',wrap_text=True)
         cell.border = brd
-    for i, w in enumerate([16,18,11,20,5,10,7,9,11,12,11,12,10,12,12,7], 1):
+    for i,w in enumerate([18,20,11,22,5,10,8,12,13,13,13,8],1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     def num(v):
         try: return float(str(v).replace("\xa0","").replace(" ","").replace(",","."))
         except: return 0.0
 
-    money_cols = [6,7,8,9,10,11,12,13,14,15]
     row = 3
     for r in rows:
         is_stock = (len(r) > 15 and r[15] == "так")
-        price_eur = num(r[19]) if len(r) > 19 else 0.0
-        if is_stock:
-            f_s = f"=L{row}-M{row}*H{row}*E{row}"
-            f_t = f"=(L{row}-J{row})-N{row}"
-        else:
-            f_s = f"=L{row}-J{row}"
-            f_t = 0
-        vals = [r[1], r[2], r[3], r[4], num(r[5]), num(r[6]), num(r[7]), num(r[8]),
-                f"=F{row}*(1+G{row}/100)*H{row}", f"=I{row}*E{row}", num(r[11]),
-                f"=K{row}*E{row}", price_eur, f_s, f_t, "так" if is_stock else ""]
-        for c, v in enumerate(vals, 1):
-            cell = ws.cell(row, c, v)
-            cell.font = Font(name='Arial', size=9)
+        vals = [r[1], r[2], r[3], r[4], num(r[5]), num(r[6]), num(r[8]),
+                num(r[11]), num(r[12]), num(r[13]), num(r[14]),
+                "так" if is_stock else ""]
+        for c,v in enumerate(vals,1):
+            cell = ws.cell(row,c,v)
+            cell.font = Font(name='Arial',size=9)
             cell.border = brd
-            cell.alignment = Alignment(vertical='center')
-            if c in money_cols:
+            if c in [5,6,7,8,9,10,11]:
                 cell.number_format = '#,##0.00'
-            cell.fill = PatternFill('solid', fgColor='FDECEA' if is_stock else ('F8F9FA' if row % 2 == 0 else 'FFFFFF'))
+            cell.fill = PatternFill('solid',fgColor='FDECEA' if is_stock else ('F8F9FA' if row%2==0 else 'FFFFFF'))
         row += 1
 
-    last = row - 1
     TOT = row
-    ws.merge_cells(f'A{TOT}:K{TOT}')
-    ws.cell(TOT, 1, 'ПІДСУМОК').font = Font(name='Arial', bold=True, size=10, color='FFFFFF')
-    ws.cell(TOT, 1).fill = PatternFill('solid', fgColor='1A5276')
-    ws.cell(TOT, 1).alignment = Alignment(horizontal='right')
-    for c in [12, 14, 15]:
+    ws.merge_cells(f'A{TOT}:H{TOT}')
+    ws.cell(TOT,1,'ПІДСУМОК').font = Font(name='Arial',bold=True,size=10,color='FFFFFF')
+    ws.cell(TOT,1).fill = PatternFill('solid',fgColor='1A5276')
+    ws.cell(TOT,1).alignment = Alignment(horizontal='right')
+    for c in [9,10,11]:
         cl = get_column_letter(c)
-        cell = ws.cell(TOT, c, f'=SUM({cl}3:{cl}{last})' if last >= 3 else 0)
-        cell.font = Font(name='Arial', bold=True, size=10, color='FFFFFF')
-        cell.fill = PatternFill('solid', fgColor='1A5276')
+        cell = ws.cell(TOT,c,f'=SUM({cl}3:{cl}{TOT-1})')
+        cell.font = Font(name='Arial',bold=True,size=10,color='FFFFFF')
+        cell.fill = PatternFill('solid',fgColor='1A5276')
         cell.number_format = '#,##0.00'
-        cell.border = brd
 
-    SR = TOT + 2
-    r_prof, r_deliv, r_net = SR, SR + 1, SR + 2
-    labels = [('Прибуток (S+T) грн:', f'=N{TOT}+O{TOT}'),
-              ('▶ Доставка грн (можна редагувати):', round(delivery, 2)),
-              ('Чистий прибуток грн:', f'=D{r_prof}-D{r_deliv}'),
-              (f'ЗП ({SALARY_PCT}%) грн:', f'=MAX(0,D{r_net})*{SALARY_PCT}/100')]
-    for i, (lbl, val) in enumerate(labels):
-        r2 = SR + i
+    SR = TOT+2
+    labels = [('Прибуток (S+T) грн:', total_profit),
+              ('Доставка грн:', delivery),
+              ('Чистий прибуток грн:', net),
+              (f'ЗП ({SALARY_PCT}%) грн:', salary)]
+    for i,(lbl,val) in enumerate(labels):
+        r2=SR+i
         ws.merge_cells(f'A{r2}:C{r2}')
-        ws.cell(r2, 1, lbl).font = Font(name='Arial', size=10, bold=True)
-        ws.cell(r2, 1).alignment = Alignment(horizontal='right')
-        cv = ws.cell(r2, 4, val)
-        cv.number_format = '#,##0.00'
-        if i == 1:
-            cv.fill = PatternFill('solid', fgColor='EBF5FB')
-            cv.font = Font(name='Arial', size=11, color='000080', bold=True)
-        elif i == 3:
-            cv.fill = PatternFill('solid', fgColor='D5F5E3')
-            cv.font = Font(name='Arial', size=14, color='1E8449', bold=True)
+        ws.cell(r2,1,lbl).font=Font(name='Arial',size=10,bold=True)
+        ws.cell(r2,1).alignment=Alignment(horizontal='right')
+        cv=ws.cell(r2,4,round(val,2))
+        cv.number_format='#,##0.00'
+        if i==3:
+            cv.fill=PatternFill('solid',fgColor='D5F5E3')
+            cv.font=Font(name='Arial',size=14,color='1E8449',bold=True)
 
-    path = str(DATA_DIR / f"salary_{manager_name}_{month}.xlsx")
+    path = str(DATA_DIR/f"salary_{manager_name}_{month}.xlsx")
     wb.save(path)
     return path
 
@@ -1665,6 +1570,75 @@ async def cmd_sheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📊 Google таблиця:\nhttps://docs.google.com/spreadsheets/d/{SHEET_ID}"
         )
 
+# ── Payments (actual client payment dates from Teams) ─────────────────────────
+async def cmd_oplata(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin: load actual payment dates. Accepts pasted Teams text OR an .xlsx."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Немає доступу.")
+        return
+    await update.message.reply_text(
+        "💸 Надішли оплати — *встав текст* як з Teams, або кинь *Excel файл*.\n\n"
+        "Формат (як у Teams):\n"
+        "`Оплати за 29/05/26 «...»`\n"
+        "`1. КЛІЄНТ рах.834 – 64 531,20`\n"
+        "`2. КЛІЄНТ рах.835 – 33 799,20`\n\n"
+        "Можна одразу кілька днів підряд. Дата з заголовка прив'язується до всіх рах. під ним.",
+        parse_mode="Markdown"
+    )
+    return WAIT_PAYMENTS
+
+async def _finish_payments(update, new_dates: dict):
+    if not new_dates:
+        await update.message.reply_text(
+            "❌ Не знайшов жодного рядка. Перевір формат: заголовок «Оплати за ДД/ММ/РР» "
+            "і рядки з `рах.НОМЕР`.",
+            parse_mode="Markdown"
+        )
+        return
+    _merge_payment_dates(new_dates)
+    sample = list(new_dates.items())[:8]
+    lines = [f"✅ *Оплати збережено:* {len(new_dates)} рах."]
+    for inv, d in sample:
+        lines.append(f"• рах.{inv} → {d}")
+    if len(new_dates) > len(sample):
+        lines.append(f"…та ще {len(new_dates) - len(sample)}")
+    lines.append(f"\n📦 Всього в базі оплат: {len(PAYMENT_DATES)}")
+    lines.append("\nПри обробці PDF бот візьме найранішу з двох дат (таблиця / оплата).")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def handle_payments_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return ConversationHandler.END
+    new_dates = parse_payments_text(update.message.text or "")
+    await _finish_payments(update, new_dates)
+    return ConversationHandler.END
+
+async def handle_payments_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return ConversationHandler.END
+    doc = update.message.document
+    msg = await update.message.reply_text("⏳ Читаю файл оплат...")
+    try:
+        file = await ctx.bot.get_file(doc.file_id)
+        xlsx_path = str(DATA_DIR / f"pay_{doc.file_id}.xlsx")
+        await file.download_to_drive(xlsx_path)
+        wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+        text_lines = []
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c) for c in row if c is not None and str(c).strip()]
+                if cells:
+                    text_lines.append(" ".join(cells))
+        wb.close()
+        os.remove(xlsx_path)
+        new_dates = parse_payments_text("\n".join(text_lines))
+        await msg.delete()
+        await _finish_payments(update, new_dates)
+    except Exception as e:
+        logger.error(f"payments excel error: {e}")
+        await msg.edit_text(f"❌ Помилка читання файлу: {e}")
+    return ConversationHandler.END
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -1676,6 +1650,7 @@ def main():
             CommandHandler("name", cmd_name),
             CommandHandler("update", cmd_update),
             CommandHandler("rates", cmd_rates),
+            CommandHandler("oplata", cmd_oplata),
         ],
         states={
             WAIT_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, set_name)],
@@ -1692,6 +1667,12 @@ def main():
             WAIT_EXCEL: [MessageHandler(filters.Document.MimeType(
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             ), handle_excel_update)],
+            WAIT_PAYMENTS: [
+                MessageHandler(filters.Document.MimeType(
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                ), handle_payments_excel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_payments_text),
+            ],
         },
         fallbacks=[CommandHandler("start", start)],
         allow_reentry=True,
@@ -1702,6 +1683,7 @@ def main():
     app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("sheet", cmd_sheet))
+    app.add_handler(CommandHandler("oplata", cmd_oplata))
     app.add_handler(CallbackQueryHandler(callback_clear, pattern="^clear_"))
     logger.info("Bot started")
     app.run_polling(drop_pending_updates=True)
