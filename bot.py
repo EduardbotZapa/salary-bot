@@ -62,85 +62,9 @@ try:
 except:
     RATES: dict = {}
 
-# Actual client payment dates from the Teams chat: invoice_num -> "DD.MM.YYYY"
-try:
-    with open("payment_dates.json", encoding="utf-8") as f:
-        PAYMENT_DATES: dict = json.load(f)
-except:
-    PAYMENT_DATES: dict = {}
-
 def get_rate_from_archive(date_str: str) -> float:
     """Get EUR buy rate from local archive, return 0 if not found"""
     return float(RATES.get(date_str, 0))
-
-def _parse_ddmmyyyy(s):
-    """Parse 'DD.MM.YYYY' -> datetime, or None."""
-    try:
-        return datetime.strptime(str(s).strip(), "%d.%m.%Y")
-    except Exception:
-        return None
-
-def earliest_date(dates) -> str:
-    """Return the earliest valid 'DD.MM.YYYY' from the list, else ''.
-    Double-check rule: take whichever payment event came first."""
-    parsed = [(d, _parse_ddmmyyyy(d)) for d in dates if d]
-    parsed = [(d, p) for d, p in parsed if p]
-    if not parsed:
-        return ""
-    return min(parsed, key=lambda x: x[1])[0]
-
-def get_payment_date(invoice_num: str) -> str:
-    """Actual payment date for an invoice number, from the Teams payments file."""
-    if not invoice_num:
-        return ""
-    return PAYMENT_DATES.get(str(invoice_num).strip(), "")
-
-def parse_payments_text(text: str) -> dict:
-    """Parse Teams-style payment messages into {invoice_num: 'DD.MM.YYYY'}.
-
-    Format (as posted in Teams):
-        Оплати за 29/05/26 «...»
-        1. КЛІЄНТ рах.834 – 64 531,20
-        2. КЛІЄНТ рах.835 – 33 799,20
-    A line mentioning 'оплат' + a date sets the current date; every following
-    'рах.NNN' line inherits it. Several day-blocks can follow one another.
-    """
-    result = {}
-    current_date = ""
-    date_re = re.compile(r'(\d{1,2})[./](\d{1,2})[./](\d{2,4})')
-    rah_re = re.compile(r'рах\.?\s*№?\s*(\d+)', re.IGNORECASE)
-    for raw in str(text).splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if 'оплат' in line.lower():
-            m = date_re.search(line)
-            if m:
-                dd, mm, yy = m.group(1), m.group(2), m.group(3)
-                year = int(yy)
-                if year < 100:
-                    year += 2000
-                try:
-                    current_date = f"{int(dd):02d}.{int(mm):02d}.{year}"
-                except Exception:
-                    pass
-                continue
-        mi = rah_re.search(line)
-        if mi and current_date:
-            result[mi.group(1)] = current_date
-    return result
-
-def _merge_payment_dates(new_dates: dict) -> None:
-    """Merge parsed dates into PAYMENT_DATES (keeping earliest on conflict)
-    and persist to payment_dates.json."""
-    for inv, d in new_dates.items():
-        old = PAYMENT_DATES.get(inv, "")
-        PAYMENT_DATES[inv] = earliest_date([old, d]) or d
-    try:
-        with open("payment_dates.json", "w", encoding="utf-8") as f:
-            json.dump(PAYMENT_DATES, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"payment_dates save error: {e}")
 
 def get_price(art: str) -> float:
     return PRICE_LOOKUP.get(art, 0)
@@ -220,6 +144,7 @@ def refresh_live_lookup():
             price_col = col("ціна за одиницю")
             weight_col = col("нетто за 1")
             brand_col = col("виробник")
+            supplier_col = col("постачальник")
             if art_col < 0: continue
             for row in rows[1:]:
                 if len(row) <= art_col: continue
@@ -238,6 +163,7 @@ def refresh_live_lookup():
                     "cost_eur": price,
                     "weight": weight,
                     "brand": str(row[brand_col]).strip() if brand_col>=0 and brand_col<len(row) else "",
+                    "supplier": str(row[supplier_col]).strip() if supplier_col>=0 and supplier_col<len(row) else "",
                     "source": src,
                 }
         _live_cache = result
@@ -289,9 +215,9 @@ def get_or_create_ws(spreadsheet, name: str):
                "Ціна прод UAH","Виторг",
                "Прибуток (S)","Надбавка (T)","Склад?",
                "УКТЗЕД","Бренд","Джерело",
-               "Прайс EUR","Вага/шт","Вага Китай","Вага Європа","Додано"]
+               "Прайс EUR","Вага/шт","Вага Китай","Вага Європа","Додано","Постачальник"]
     ws.append_row(headers)
-    ws.format("A1:X1", {
+    ws.format("A1:Y1", {
         "backgroundColor": {"red":0.17,"green":0.18,"blue":0.24},
         "textFormat": {"bold":True,"foregroundColor":{"red":1,"green":1,"blue":1}},
         "horizontalAlignment": "CENTER"
@@ -327,19 +253,19 @@ def append_to_sheets(manager_name: str, inv: dict):
 
         # Separator row (if not first entry)
         if start_row > 2:
-            rows_to_write.append([""] * 24)
+            rows_to_write.append([""] * 25)
             format_requests.append({
-                "range": f"A{start_row}:X{start_row}",
+                "range": f"A{start_row}:Y{start_row}",
                 "format": {"backgroundColor": {"red": 0.85, "green": 0.91, "blue": 0.97}}
             })
-            all_sheet_rows.append([""] * 24)
+            all_sheet_rows.append([""] * 25)
             start_row += 1
 
         # Invoice header row
-        header = [manager_name, client, invoice_num, date] + [""] * 20
+        header = [manager_name, client, invoice_num, date] + [""] * 21
         rows_to_write.append(header)
         format_requests.append({
-            "range": f"A{start_row}:X{start_row}",
+            "range": f"A{start_row}:Y{start_row}",
             "format": {
                 "backgroundColor": {"red": 0.78, "green": 0.87, "blue": 0.95},
                 "textFormat": {"bold": True}
@@ -392,7 +318,8 @@ def append_to_sheets(manager_name: str, inv: dict):
                 round(weight_unit, 3) if weight_unit else "",    # U Вага/шт
                 round(weight_unit * item["qty"], 3) if (is_stock and source == "Китай") else 0,  # V Вага Китай
                 round(weight_unit * item["qty"], 3) if (is_stock and "trade" in source.lower()) else 0,  # W Вага Європа
-                datetime.now().strftime("%d.%m.%Y %H:%M"),       # X
+                datetime.now().strftime("%d.%m.%Y %H:%M"),       # X Додано
+                lu.get("supplier", ""),                          # Y Постачальник
             ]
             rows_to_write.append(row)
             all_sheet_rows.append(row)
@@ -406,7 +333,7 @@ def append_to_sheets(manager_name: str, inv: dict):
         first_row = len(existing) + 1
         last_row = first_row + len(rows_to_write) - 1
         ws_mgr.update(
-            f"A{first_row}:X{last_row}",
+            f"A{first_row}:Y{last_row}",
             rows_to_write,
             value_input_option="USER_ENTERED"
         )
@@ -794,7 +721,7 @@ def build_excel(manager_name, invoices, month):
     return path
 
 # ── States ────────────────────────────────────────────────────────────────────
-WAIT_NAME, WAIT_DATE, WAIT_STOCK, WAIT_DELIVERY, WAIT_EXCEL, WAIT_RATES, WAIT_PAYMENTS = range(7)
+WAIT_NAME, WAIT_DATE, WAIT_STOCK, WAIT_DELIVERY, WAIT_EXCEL, WAIT_RATES = range(6)
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -884,11 +811,9 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"⚠️ Не знайдено ({len(not_found)}): {', '.join(not_found)}")
 
     # ── Date & rate logic ────────────────────────────────────────────────────
-    # Two possible date sources for this invoice:
-    #   1) confirm_date from the orders table (invoice_lookup, via /update)
-    #   2) actual client payment date from the Teams payments file (/oplata)
-    # Double-check rule: use whichever event came FIRST (the earliest date).
-    confirm_date = ""
+    # Find date ONLY from invoice-specific records (matching THIS invoice number)
+    # Stock items from general lookup don't count - we need explicit confirmation
+    auto_date = ""
     if inv_number:
         for item in parsed["items"]:
             inv_key = f"{inv_number}:{item['article']}"
@@ -896,15 +821,8 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 rec = INVOICE_LOOKUP[inv_key]
                 d = rec.get("confirm_date", "")
                 if d:
-                    confirm_date = d
+                    auto_date = d
                     break
-
-    payment_date = get_payment_date(inv_number)
-    auto_date = earliest_date([confirm_date, payment_date])
-    # Show a note when the two sources disagree so the manager sees the check fired
-    date_note = ""
-    if confirm_date and payment_date and confirm_date != payment_date:
-        date_note = f" _(найраніша з: таблиця {confirm_date} / оплата {payment_date})_"
 
     items = ctx.user_data["pending_invoice"].get("items", [])
     ctx.user_data["stock_selected"] = set()
@@ -917,11 +835,11 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data["pending_invoice"]["date"] = auto_date
             for item in ctx.user_data["pending_invoice"]["items"]:
                 item["rate"] = rate
-            lines.append(f"\n💱 Дата: *{auto_date}* | Курс: *{rate:.2f} грн/EUR* (+{RATE_MARKUP}%){date_note}")
+            lines.append(f"\n💱 Дата: *{auto_date}* | Курс: *{rate:.2f} грн/EUR* (+{RATE_MARKUP}%)")
         else:
             ctx.user_data["pending_invoice"]["rate"] = 0
             ctx.user_data["pending_invoice"]["date"] = auto_date
-            lines.append(f"\n💱 Дата: *{auto_date}* | ⚠️ Курс не знайдено — вкажи вручну в таблиці{date_note}")
+            lines.append(f"\n💱 Дата: *{auto_date}* | ⚠️ Курс не знайдено — вкажи вручну в таблиці")
 
         await msg.edit_text("\n".join(lines), parse_mode="Markdown")
         await msg.reply_text(
@@ -1447,6 +1365,7 @@ async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             duty_i = find_col(['мито'])
             weight_i = find_col(['нетто за 1', 'вага'])
             brand_i = find_col(['виробник', 'brand'])
+            supplier_i = find_col(['постачальник', 'поставщик', 'supplier'])
             date_i = find_col(['дата підтвердження'])
             inv_col_name = invoice_col_names.get(sheet, '№ Рахунку')
             invoice_i = find_col([inv_col_name])
@@ -1472,6 +1391,9 @@ async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 try: brand = str(row.iloc[brand_i]).strip() if brand_i >= 0 else ''
                 except: brand = ''
                 brand = '' if brand == 'nan' else brand
+                try: supplier = str(row.iloc[supplier_i]).strip() if supplier_i >= 0 else ''
+                except: supplier = ''
+                supplier = '' if supplier in ('nan', 'NaN', 'None', '') else shorten_company(supplier)
 
                 date_str = ''
                 date_obj = None
@@ -1500,6 +1422,7 @@ async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     'confirm_date': date_str,
                     'invoice_num': inv_num,
                     'is_storage': is_storage,
+                    'supplier': supplier,
                 }
 
                 # Stock lookup
@@ -1570,75 +1493,6 @@ async def cmd_sheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📊 Google таблиця:\nhttps://docs.google.com/spreadsheets/d/{SHEET_ID}"
         )
 
-# ── Payments (actual client payment dates from Teams) ─────────────────────────
-async def cmd_oplata(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin: load actual payment dates. Accepts pasted Teams text OR an .xlsx."""
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Немає доступу.")
-        return
-    await update.message.reply_text(
-        "💸 Надішли оплати — *встав текст* як з Teams, або кинь *Excel файл*.\n\n"
-        "Формат (як у Teams):\n"
-        "`Оплати за 29/05/26 «...»`\n"
-        "`1. КЛІЄНТ рах.834 – 64 531,20`\n"
-        "`2. КЛІЄНТ рах.835 – 33 799,20`\n\n"
-        "Можна одразу кілька днів підряд. Дата з заголовка прив'язується до всіх рах. під ним.",
-        parse_mode="Markdown"
-    )
-    return WAIT_PAYMENTS
-
-async def _finish_payments(update, new_dates: dict):
-    if not new_dates:
-        await update.message.reply_text(
-            "❌ Не знайшов жодного рядка. Перевір формат: заголовок «Оплати за ДД/ММ/РР» "
-            "і рядки з `рах.НОМЕР`.",
-            parse_mode="Markdown"
-        )
-        return
-    _merge_payment_dates(new_dates)
-    sample = list(new_dates.items())[:8]
-    lines = [f"✅ *Оплати збережено:* {len(new_dates)} рах."]
-    for inv, d in sample:
-        lines.append(f"• рах.{inv} → {d}")
-    if len(new_dates) > len(sample):
-        lines.append(f"…та ще {len(new_dates) - len(sample)}")
-    lines.append(f"\n📦 Всього в базі оплат: {len(PAYMENT_DATES)}")
-    lines.append("\nПри обробці PDF бот візьме найранішу з двох дат (таблиця / оплата).")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def handle_payments_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return ConversationHandler.END
-    new_dates = parse_payments_text(update.message.text or "")
-    await _finish_payments(update, new_dates)
-    return ConversationHandler.END
-
-async def handle_payments_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return ConversationHandler.END
-    doc = update.message.document
-    msg = await update.message.reply_text("⏳ Читаю файл оплат...")
-    try:
-        file = await ctx.bot.get_file(doc.file_id)
-        xlsx_path = str(DATA_DIR / f"pay_{doc.file_id}.xlsx")
-        await file.download_to_drive(xlsx_path)
-        wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-        text_lines = []
-        for ws in wb.worksheets:
-            for row in ws.iter_rows(values_only=True):
-                cells = [str(c) for c in row if c is not None and str(c).strip()]
-                if cells:
-                    text_lines.append(" ".join(cells))
-        wb.close()
-        os.remove(xlsx_path)
-        new_dates = parse_payments_text("\n".join(text_lines))
-        await msg.delete()
-        await _finish_payments(update, new_dates)
-    except Exception as e:
-        logger.error(f"payments excel error: {e}")
-        await msg.edit_text(f"❌ Помилка читання файлу: {e}")
-    return ConversationHandler.END
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -1650,7 +1504,6 @@ def main():
             CommandHandler("name", cmd_name),
             CommandHandler("update", cmd_update),
             CommandHandler("rates", cmd_rates),
-            CommandHandler("oplata", cmd_oplata),
         ],
         states={
             WAIT_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, set_name)],
@@ -1667,12 +1520,6 @@ def main():
             WAIT_EXCEL: [MessageHandler(filters.Document.MimeType(
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             ), handle_excel_update)],
-            WAIT_PAYMENTS: [
-                MessageHandler(filters.Document.MimeType(
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                ), handle_payments_excel),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_payments_text),
-            ],
         },
         fallbacks=[CommandHandler("start", start)],
         allow_reentry=True,
@@ -1683,7 +1530,6 @@ def main():
     app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("sheet", cmd_sheet))
-    app.add_handler(CommandHandler("oplata", cmd_oplata))
     app.add_handler(CallbackQueryHandler(callback_clear, pattern="^clear_"))
     logger.info("Bot started")
     app.run_polling(drop_pending_updates=True)
