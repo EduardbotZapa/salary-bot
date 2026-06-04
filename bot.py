@@ -90,6 +90,27 @@ try:
 except:
     INVOICE_META: dict = {}
 
+# Invoice totals (виторг) captured at PDF-processing time: "65" -> revenue_uah.
+# This is the SOURCE OF TRUTH for «Сума рахунку», so we never have to guess it
+# from the «ВСІ» sheet (which failed for older invoices).
+try:
+    with open("invoice_totals.json", encoding="utf-8") as f:
+        INVOICE_TOTALS: dict = json.load(f)
+except:
+    INVOICE_TOTALS: dict = {}
+
+def _save_invoice_totals():
+    try:
+        with open("invoice_totals.json", "w", encoding="utf-8") as f:
+            json.dump(INVOICE_TOTALS, f, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"save invoice_totals error: {e}")
+
+def _inv_num(invoice_num_str: str) -> str:
+    """Extract the bare invoice number ('65') from 'Рахунок №65 від ...'."""
+    m = re.search(r"[№#No]+\s*(\d+)", str(invoice_num_str))
+    return m.group(1) if m else ""
+
 def get_rate_from_archive(date_str: str) -> float:
     """Get EUR buy rate from local archive, return 0 if not found"""
     return float(RATES.get(date_str, 0))
@@ -635,6 +656,37 @@ async def get_nbu_rate(date_str: str):
     return None
 
 
+async def get_payment_rate(date_str: str):
+    """Rate for a PAYMENT date — used for 50/50 коригування.
+
+    archive (межбанк, +markup)  →  NBU official by EXACT date (+markup).
+
+    Deliberately does NOT use the greedy Minfin scrape: for dates outside the
+    local archive that scrape grabs the *current* rate (e.g. 52,72 for every
+    old date), which made both tranches identical and zeroed out коригування.
+    NBU is date-accurate, so distinct payment dates get distinct rates.
+    """
+    a = get_rate_from_archive(date_str)
+    if a > 0:
+        return round(a * (1 + RATE_MARKUP / 100), 2)
+    try:
+        dt = datetime.strptime(date_str, "%d.%m.%Y")
+        url = (f"https://bank.gov.ua/NBU_Exchange/exchange_site?"
+               f"start={dt:%Y%m%d}&end={dt:%Y%m%d}&valcode=EUR"
+               f"&sort=exchangedate&order=desc&json")
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            data = r.json()
+            if data:
+                rate = float(data[0]["rate"])
+                final = round(rate * (1 + RATE_MARKUP / 100), 2)
+                logger.info(f"Payment rate NBU {date_str}: {rate} -> {final}")
+                return final
+    except Exception as e:
+        logger.warning(f"payment rate error {date_str}: {e}")
+    return None
+
+
 # ── PDF parser ────────────────────────────────────────────────────────────────
 def parse_pdf(path: str) -> dict:
     result = {"invoice_num":"","date":"","client":"","items":[]}
@@ -1163,6 +1215,7 @@ async def save_invoice(query, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("stock_selected", None)
 
     total_profit = 0
+    total_revenue = 0.0
     for item in inv.get("items", []):
         lu = lookup_article(item["article"])
         cost_eur = lu.get("cost_eur", 0)
@@ -1170,8 +1223,48 @@ async def save_invoice(query, ctx: ContextTypes.DEFAULT_TYPE):
         rate = item.get("rate", 52.0)
         cost_uah = cost_eur * (1 + duty) * rate * item["qty"]
         revenue = item["price_uah"] * item["qty"]
+        total_revenue += revenue
         profit = (item["price_uah"] - cost_eur * (1 + duty) * rate) * item["qty"] if item.get("is_stock") else revenue - cost_uah
         total_profit += profit
+
+    # ── Перевірка оплат у момент завантаження рахунку ─────────────────────────
+    # Тут сума рахунку (виторг) відома напряму з PDF, тому її НЕ треба шукати в «ВСІ».
+    # Зберігаємо її як джерело правди й одразу дивимось: скільки оплат, на яку суму,
+    # чи закрито, і чи треба коригування 50/50.
+    inv_num = _inv_num(inv.get("invoice_num", ""))
+    pay_block = ""
+    if inv_num and total_revenue > 0:
+        INVOICE_TOTALS[inv_num] = round(total_revenue, 2)
+        _save_invoice_totals()
+        _ensure_payments_loaded()
+        tr = get_payments(inv_num)
+        if tr:
+            paid = total_paid(inv_num)
+            n = len(tr)
+            closed = paid >= total_revenue * 0.995
+            if closed:
+                wr = weighted_rate(inv_num)
+                fr = first_payment_rate(inv_num)
+                if wr > 0 and fr > 0 and abs(wr - fr) > 1e-6:
+                    korig = round(total_revenue * (wr / fr - 1), 2)
+                    total_profit += korig
+                    pay_block = (
+                        f"\n\n💳 Оплат: {n}, разом {paid:,.0f} грн — *закрито*\n"
+                        f"Курс 1-ї опл.: {fr:.2f} → зважений: {wr:.2f}\n"
+                        f"⚖️ Коригування 50/50: *{korig:+,.0f} грн* (у прибутку)"
+                    ).replace(",", " ")
+                else:
+                    pay_block = (
+                        f"\n\n💳 Оплат: {n}, разом {paid:,.0f} грн — *закрито* "
+                        f"(один курс, коригування не потрібне)"
+                    ).replace(",", " ")
+            else:
+                pay_block = (
+                    f"\n\n💳 Оплат: {n}, разом {paid:,.0f} з {total_revenue:,.0f} грн — *часткова*\n"
+                    f"⚠️ У ЗП піде лише після повної оплати"
+                ).replace(",", " ")
+        else:
+            pay_block = "\n\n💳 Оплат по цьому рахунку ще немає"
 
     stock_count = len(selected)
     stock_msg = f"🔴 Складських: {stock_count}" if stock_count else "🟢 Складських немає"
@@ -1181,7 +1274,8 @@ async def save_invoice(query, ctx: ContextTypes.DEFAULT_TYPE):
         f"💰 Прибуток: *{total_profit:,.0f} грн*\n"
         f"{stock_msg}\n"
         f"📁 Рахунків цього місяця: {len(user.get('invoices', []))}\n"
-        f"{sheet_msg}\n\n"
+        f"{sheet_msg}"
+        f"{pay_block}\n\n"
         f"Надішли наступний PDF або /report для Excel.",
         parse_mode="Markdown"
     )
@@ -1271,25 +1365,35 @@ def read_invoices_for_manager(manager_name: str):
         return None, str(e)
 
 def invoice_revenue_map_all() -> dict:
-    """Map invoice_num -> total revenue (виторг) from the 'ВСІ' sheet."""
+    """Map invoice_num -> total revenue (виторг).
+
+    Primary source = totals captured from the PDF at upload time
+    (INVOICE_TOTALS). The 'ВСІ' sheet is only a best-effort fallback for
+    invoices processed before this was introduced.
+    """
     out = {}
     try:
         sh = get_gsheet()
-        if not sh:
-            return out
-        try:
-            ws = sh.worksheet("ВСІ")
-        except gspread.WorksheetNotFound:
-            return out
-        for g in _group_rows_by_invoice(ws.get_all_values()):
-            if not g["inv"]:
-                continue
-            rev = sum(_num_cell(r[12]) for r in g["rows"] if len(r) > 12)
-            out[g["inv"]] = round(out.get(g["inv"], 0) + rev, 2)
-        return out
+        if sh:
+            try:
+                ws = sh.worksheet("ВСІ")
+                for g in _group_rows_by_invoice(ws.get_all_values()):
+                    if not g["inv"]:
+                        continue
+                    rev = sum(_num_cell(r[12]) for r in g["rows"] if len(r) > 12)
+                    out[g["inv"]] = round(out.get(g["inv"], 0) + rev, 2)
+            except gspread.WorksheetNotFound:
+                pass
     except Exception as e:
         logger.error(f"revenue map error: {e}")
-        return out
+    # Totals captured from PDF win over anything read from the sheet.
+    for inv, tot in INVOICE_TOTALS.items():
+        try:
+            if tot and float(tot) > 0:
+                out[str(inv)] = round(float(tot), 2)
+        except:
+            pass
+    return out
 
 def _load_payments_from_sheet():
     """Durable store = 'Оплати' tab. Load it into PAYMENTS (sheet wins)."""
@@ -1999,7 +2103,7 @@ async def _finish_payments(update, tranches: list):
     for t in tranches:
         d = t["date"]
         if d not in rate_cache:
-            rate_cache[d] = await get_nbu_rate(d) or 0.0
+            rate_cache[d] = await get_payment_rate(d) or 0.0
         t["rate"] = rate_cache[d]
 
     added = _merge_payment_tranches(tranches)
