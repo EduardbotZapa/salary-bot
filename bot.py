@@ -62,12 +62,26 @@ try:
 except:
     RATES: dict = {}
 
-# Actual client payment dates: "invoice_num" -> "DD.MM.YYYY"
+# Client payments per invoice (supports partial payments / tranches):
+#   "invoice_num" -> [ {"date": "DD.MM.YYYY", "amount": float, "rate": float}, ... ]
+try:
+    with open("payments.json", encoding="utf-8") as f:
+        PAYMENTS: dict = json.load(f)
+except:
+    PAYMENTS: dict = {}
+
+# Backward-compat: migrate old payment_dates.json ({inv: "date"}) into tranche form
 try:
     with open("payment_dates.json", encoding="utf-8") as f:
-        PAYMENT_DATES: dict = json.load(f)
+        _old_pd = json.load(f)
+    for _inv, _d in _old_pd.items():
+        _inv = str(_inv).strip()
+        if _inv not in PAYMENTS and isinstance(_d, str) and _d:
+            PAYMENTS[_inv] = [{"date": _d, "amount": 0.0, "rate": 0.0}]
 except:
-    PAYMENT_DATES: dict = {}
+    pass
+
+_payments_loaded_from_sheet = False  # lazy-load guard (durable store = Google tab)
 
 # Invoice-level meta from orders table: "invoice_num" -> {manager, pay_date, supplier}
 try:
@@ -80,11 +94,41 @@ def get_rate_from_archive(date_str: str) -> float:
     """Get EUR buy rate from local archive, return 0 if not found"""
     return float(RATES.get(date_str, 0))
 
-def get_payment_date(inv_num: str) -> str:
-    """Actual client payment date for an invoice number, or '' if none."""
+def get_payments(inv_num: str) -> list:
+    """All payment tranches for an invoice number, or [] if none."""
     if not inv_num:
-        return ""
-    return PAYMENT_DATES.get(str(inv_num).strip(), "")
+        return []
+    return PAYMENTS.get(str(inv_num).strip(), []) or []
+
+def get_payment_date(inv_num: str) -> str:
+    """EARLIEST tranche date for an invoice number, or '' if none."""
+    tr = get_payments(inv_num)
+    dates = [t.get("date", "") for t in tr if t.get("date")]
+    return _earliest_date(*dates) if dates else ""
+
+def total_paid(inv_num: str) -> float:
+    return round(sum(float(t.get("amount", 0) or 0) for t in get_payments(inv_num)), 2)
+
+def weighted_rate(inv_num: str) -> float:
+    """Payment-amount-weighted rate across tranches; 0 if not computable."""
+    tr = [t for t in get_payments(inv_num)
+          if float(t.get("amount", 0) or 0) > 0 and float(t.get("rate", 0) or 0) > 0]
+    if not tr:
+        return 0.0
+    num = sum(float(t["amount"]) * float(t["rate"]) for t in tr)
+    den = sum(float(t["amount"]) for t in tr)
+    return round(num / den, 4) if den else 0.0
+
+def first_payment_rate(inv_num: str) -> float:
+    """Rate of the earliest-dated tranche (the base rate the invoice was priced at)."""
+    tr = [t for t in get_payments(inv_num) if t.get("date")]
+    if not tr:
+        return 0.0
+    tr = sorted(tr, key=lambda x: _dt(x.get("date", "")))
+    for t in tr:
+        if float(t.get("rate", 0) or 0) > 0:
+            return round(float(t["rate"]), 4)
+    return 0.0
 
 def _earliest_date(*dates) -> str:
     """Return earliest of given DD.MM.YYYY dates (ignores blanks)."""
@@ -96,15 +140,15 @@ def _earliest_date(*dates) -> str:
     except:
         return valid[0]
 
-def _parse_payment_text(text: str) -> dict:
-    """Parse Teams-style payment text.
+def _parse_payment_text(text: str) -> list:
+    """Parse Teams-style payment text into tranches.
 
     Header line:  Оплати за ДД/ММ/РР «...»
     Item lines:   1. КЛІЄНТ рах.834 – 64 531,20
     Header date binds to every рах.НОМЕР below it until the next header.
-    Returns {invoice_num: "DD.MM.YYYY"}.
+    Returns list of {"inv": "834", "date": "DD.MM.YYYY", "amount": float}.
     """
-    result: dict = {}
+    out: list = []
     cur_date = ""
     for line in text.splitlines():
         h = re.search(
@@ -121,24 +165,57 @@ def _parse_payment_text(text: str) -> dict:
                 cur_date = ""
             continue
         if cur_date:
-            for m in re.finditer(r"рах\.?\s*№?\s*(\d+)", line, re.IGNORECASE):
-                result[m.group(1)] = cur_date
-    return result
+            # рах.НОМЕР  optionally followed by  – СУМА
+            for m in re.finditer(
+                r"рах\.?\s*№?\s*(\d+)\s*(?:[–—\-:]\s*([\d][\d\s.,]*))?",
+                line, re.IGNORECASE
+            ):
+                inv = m.group(1)
+                amount = 0.0
+                if m.group(2):
+                    try:
+                        s = m.group(2).replace(" ", "").replace("\xa0", "")
+                        if s.count(",") and s.count("."):
+                            s = s.replace(".", "").replace(",", ".")
+                        else:
+                            s = s.replace(",", ".")
+                        amount = float(s)
+                    except:
+                        amount = 0.0
+                out.append({"inv": inv, "date": cur_date, "amount": amount})
+    return out
 
-def _merge_payment_dates(new_dates: dict):
-    """Merge new payment dates into PAYMENT_DATES, keep EARLIEST on conflict, save."""
-    for inv, d in new_dates.items():
-        inv = str(inv).strip()
-        old = PAYMENT_DATES.get(inv)
-        if old:
-            PAYMENT_DATES[inv] = _earliest_date(old, d) or d
-        else:
-            PAYMENT_DATES[inv] = d
+def _save_payments():
     try:
-        with open("payment_dates.json", "w", encoding="utf-8") as f:
-            json.dump(PAYMENT_DATES, f, ensure_ascii=False, indent=2)
+        with open("payments.json", "w", encoding="utf-8") as f:
+            json.dump(PAYMENTS, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error(f"payment_dates save error: {e}")
+        logger.error(f"payments save error: {e}")
+
+def _merge_payment_tranches(tranches: list) -> int:
+    """Merge tranches (each {inv,date,amount,rate}) into PAYMENTS.
+    Dedupe identical (date, amount) for the same invoice. Returns count added."""
+    added = 0
+    for t in tranches:
+        inv = str(t["inv"]).strip()
+        lst = PAYMENTS.setdefault(inv, [])
+        dup = any(
+            x.get("date") == t["date"] and round(float(x.get("amount", 0) or 0), 2) == round(float(t.get("amount", 0) or 0), 2)
+            for x in lst
+        )
+        if dup:
+            continue
+        lst.append({"date": t["date"], "amount": round(float(t.get("amount", 0) or 0), 2),
+                    "rate": round(float(t.get("rate", 0) or 0), 4)})
+        added += 1
+    # keep tranches sorted by date
+    for inv, lst in PAYMENTS.items():
+        try:
+            lst.sort(key=lambda x: datetime.strptime(x.get("date", "01.01.1900"), "%d.%m.%Y"))
+        except:
+            pass
+    _save_payments()
+    return added
 
 def get_price(art: str) -> float:
     return PRICE_LOOKUP.get(art, 0)
@@ -905,6 +982,7 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if not table_confirm: table_confirm = rec.get("confirm_date", "") or ""
                 if not auto_manager:  auto_manager = rec.get("manager", "") or ""
 
+    _ensure_payments_loaded()
     oplata_pay = get_payment_date(inv_number)
     pay_eff = _earliest_date(table_pay, oplata_pay)
     auto_date = pay_eff or table_confirm
@@ -1140,6 +1218,158 @@ def read_sheet_rows_for_manager(manager_name: str):
         logger.error(f"read_sheet error: {e}")
         return None, str(e)
 
+def _dt(s):
+    try:
+        return datetime.strptime(s, "%d.%m.%Y")
+    except:
+        return datetime.min
+
+def _num_cell(v):
+    try:
+        return float(str(v).replace("\xa0","").replace(" ","").replace(",","."))
+    except:
+        return 0.0
+
+def _group_rows_by_invoice(all_vals):
+    """Group a manager/ВСІ sheet's rows into invoices.
+    Returns list of {'inv': num, 'rows': [item rows]} (header/separator rows excluded)."""
+    groups = []
+    cur = None
+    for r in all_vals[1:]:
+        if len(r) < 5:
+            continue
+        cnum = r[2].strip() if len(r) > 2 else ""
+        art = r[4].strip() if len(r) > 4 else ""
+        if art:
+            if cur is None:
+                cur = {"inv": "", "rows": []}
+                groups.append(cur)
+            cur["rows"].append(r)
+        elif cnum:
+            m = re.search(r"[№#No]+\s*(\d+)", cnum)
+            cur = {"inv": m.group(1) if m else "", "rows": []}
+            groups.append(cur)
+        # fully-empty separator row → ignore
+    return [g for g in groups if g["rows"]]
+
+def read_invoices_for_manager(manager_name: str):
+    """Read manager's sheet grouped by invoice. Returns (groups, status)."""
+    try:
+        sh = get_gsheet()
+        if not sh:
+            return None, "no_connection"
+        try:
+            ws = sh.worksheet(manager_name)
+        except gspread.WorksheetNotFound:
+            return [], "no_sheet"
+        all_vals = ws.get_all_values()
+        if len(all_vals) < 2:
+            return [], "empty"
+        return _group_rows_by_invoice(all_vals), "ok"
+    except Exception as e:
+        logger.error(f"read_invoices error: {e}")
+        return None, str(e)
+
+def invoice_revenue_map_all() -> dict:
+    """Map invoice_num -> total revenue (виторг) from the 'ВСІ' sheet."""
+    out = {}
+    try:
+        sh = get_gsheet()
+        if not sh:
+            return out
+        try:
+            ws = sh.worksheet("ВСІ")
+        except gspread.WorksheetNotFound:
+            return out
+        for g in _group_rows_by_invoice(ws.get_all_values()):
+            if not g["inv"]:
+                continue
+            rev = sum(_num_cell(r[12]) for r in g["rows"] if len(r) > 12)
+            out[g["inv"]] = round(out.get(g["inv"], 0) + rev, 2)
+        return out
+    except Exception as e:
+        logger.error(f"revenue map error: {e}")
+        return out
+
+def _load_payments_from_sheet():
+    """Durable store = 'Оплати' tab. Load it into PAYMENTS (sheet wins)."""
+    global _payments_loaded_from_sheet
+    _payments_loaded_from_sheet = True
+    try:
+        sh = get_gsheet()
+        if not sh:
+            return
+        try:
+            ws = sh.worksheet("Оплати")
+        except gspread.WorksheetNotFound:
+            return
+        vals = ws.get_all_values()
+        loaded = {}
+        for r in vals[1:]:
+            if len(r) < 2:
+                continue
+            inv = re.sub(r"\D", "", str(r[0]))
+            date = str(r[1]).strip() if len(r) > 1 else ""
+            if not inv or not date:
+                continue
+            amount = _num_cell(r[2]) if len(r) > 2 else 0.0
+            rate = _num_cell(r[3]) if len(r) > 3 else 0.0
+            loaded.setdefault(inv, []).append(
+                {"date": date, "amount": round(amount, 2), "rate": round(rate, 4)})
+        if loaded:
+            for inv, lst in loaded.items():
+                PAYMENTS[inv] = lst
+            _save_payments()
+    except Exception as e:
+        logger.error(f"load payments from sheet error: {e}")
+
+def _ensure_payments_loaded():
+    if not _payments_loaded_from_sheet:
+        _load_payments_from_sheet()
+
+def _write_payments_sheet(revenue_map: dict) -> bool:
+    """Rebuild the 'Оплати' tab from PAYMENTS with accumulation + status."""
+    sh = get_gsheet()
+    if not sh:
+        return False
+    try:
+        try:
+            ws = sh.worksheet("Оплати")
+            ws.clear()
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title="Оплати", rows=2000, cols=8)
+        header = ["Рахунок", "Дата оплати", "Сума оплати", "Курс",
+                  "Накопичено", "Сума рахунку", "Статус"]
+        rows = [header]
+        for inv in sorted(PAYMENTS.keys(), key=lambda x: (len(x), x)):
+            tr = sorted(PAYMENTS[inv], key=lambda x: _dt(x.get("date", "")))
+            total = revenue_map.get(inv, 0)
+            acc = 0.0
+            for t in tr:
+                acc += float(t.get("amount", 0) or 0)
+                if total > 0:
+                    status = "закрито" if acc >= total * 0.995 else "часткова"
+                elif acc > 0:
+                    status = "невідома сума рах."
+                else:
+                    status = ""
+                rows.append([inv, t.get("date", ""),
+                             round(float(t.get("amount", 0) or 0), 2),
+                             round(float(t.get("rate", 0) or 0), 4),
+                             round(acc, 2),
+                             round(total, 2) if total else "",
+                             status])
+        ws.update(f"A1:G{len(rows)}", rows, value_input_option="USER_ENTERED")
+        ws.format("A1:G1", {
+            "backgroundColor": {"red": 0.17, "green": 0.18, "blue": 0.24},
+            "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
+            "horizontalAlignment": "CENTER"
+        })
+        return True
+    except Exception as e:
+        logger.error(f"write payments sheet error: {e}")
+        return False
+
 async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().replace("/","")
     try:
@@ -1152,49 +1382,83 @@ async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = user.get("name", str(uid))
     month = datetime.now().strftime("%m.%Y")
 
-    # Read straight from Google Sheets (survives restarts)
-    rows, status = read_sheet_rows_for_manager(name)
+    _ensure_payments_loaded()
 
+    # Read manager's sheet grouped by invoice
+    groups, status = read_invoices_for_manager(name)
     if status == "no_connection":
         await update.message.reply_text("⚠️ Google Sheets недоступний. Спробуй пізніше.")
         return ConversationHandler.END
-    if status in ("no_sheet", "empty") or not rows:
+    if status in ("no_sheet", "empty") or not groups:
         await update.message.reply_text("📭 Немає рахунків цього місяця в таблиці.")
         return ConversationHandler.END
 
-    # Sum profit from columns N (Прибуток S, idx 13) + O (Надбавка T, idx 14)
-    # and revenue from M (Виторг, idx 12)
     def num(v):
-        try:
-            return float(str(v).replace("\xa0","").replace(" ","").replace(",","."))
-        except:
-            return 0.0
+        return _num_cell(v)
 
+    counted_rows = []      # item rows of invoices that count toward salary
     total_revenue = 0.0
     total_profit = 0.0
-    for r in rows:
-        revenue = num(r[12])          # M Виторг
-        s_val = num(r[13])            # N Прибуток (S)
-        t_val = num(r[14])            # O Надбавка (T)
-        total_revenue += revenue
-        total_profit += (s_val + t_val)
+    open_invoices = []     # [(inv, paid, total)]
+    closed_breakdown = []  # [(inv, revenue, wrate, profit)]
+
+    for g in groups:
+        inv = g["inv"]
+        rows = g["rows"]
+        revenue = sum(num(r[12]) for r in rows)                     # M Виторг
+        profit_old = sum(num(r[13]) + num(r[14]) for r in rows)     # N+O (база)
+
+        tranches = get_payments(inv) if inv else []
+        if not tranches:
+            # No payment data → behave as before
+            counted_rows.extend(rows)
+            total_revenue += revenue
+            total_profit += profit_old
+            continue
+
+        paid = round(sum(float(t.get("amount", 0) or 0) for t in tranches), 2)
+        amounts_known = any(float(t.get("amount", 0) or 0) > 0 for t in tranches)
+        is_closed = (not amounts_known) or (revenue <= 0) or (paid >= revenue * 0.995)
+
+        if not is_closed:
+            open_invoices.append((inv, paid, round(revenue, 2)))
+            continue
+
+        # Currency-difference коригування: база за курсом 1-ї оплати,
+        # пізніше оплачена частка дорожчає за своїм курсом.
+        first_rate = first_payment_rate(inv)
+        wr = weighted_rate(inv)
+        korig = 0.0
+        if first_rate > 0 and wr > 0:
+            korig = round(revenue * (wr / first_rate - 1), 2)
+        profit = round(profit_old + korig, 2)
+
+        counted_rows.extend(rows)
+        total_revenue += round(revenue + korig, 2)
+        total_profit += profit
+        closed_breakdown.append((inv, round(revenue, 2), first_rate, wr, korig, profit))
 
     net = total_profit - delivery
     salary = max(0, net) * SALARY_PCT / 100
 
-    # Build simple Excel from sheet rows
-    path = build_excel_from_rows(name, rows, month, delivery, total_revenue, total_profit, net, salary)
+    path = build_excel_from_rows(name, counted_rows, month, delivery, total_revenue,
+                                 total_profit, net, salary, closed_breakdown, open_invoices)
+
+    open_msg = ""
+    if open_invoices:
+        open_msg = f"\n⏳ Відкритих (не в ЗП): *{len(open_invoices)}*"
 
     await update.message.reply_document(
         document=open(path,"rb"),
         filename=f"ЗП_{name}_{month}.xlsx",
         caption=(
             f"📊 *Звіт за {month}*\n\n"
-            f"Позицій: {len(rows)}\n"
+            f"Позицій (зараховано): {len(counted_rows)}\n"
             f"Виторг: *{total_revenue:,.0f} грн*\n"
-            f"Прибуток (S+T): *{total_profit:,.0f} грн*\n"
+            f"Прибуток: *{total_profit:,.0f} грн*\n"
             f"Доставка: *{delivery:,.0f} грн*\n"
-            f"Чистий: *{net:,.0f} грн*\n"
+            f"Чистий: *{net:,.0f} грн*"
+            f"{open_msg}\n"
             f"━━━━━━━━━━━━\n"
             f"💰 *ЗП ({SALARY_PCT}%): {salary:,.0f} грн*"
         ),
@@ -1202,7 +1466,8 @@ async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-def build_excel_from_rows(manager_name, rows, month, delivery, total_revenue, total_profit, net, salary):
+def build_excel_from_rows(manager_name, rows, month, delivery, total_revenue, total_profit, net, salary,
+                          closed_breakdown=None, open_invoices=None):
     """Build Excel report from Google Sheet rows."""
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -1276,6 +1541,44 @@ def build_excel_from_rows(manager_name, rows, month, delivery, total_revenue, to
         if i==3:
             cv.fill=PatternFill('solid',fgColor='D5F5E3')
             cv.font=Font(name='Arial',size=14,color='1E8449',bold=True)
+
+    nxt = SR + len(labels) + 1
+
+    # Closed invoices with currency-difference коригування (paid across >1 rate)
+    cb = [b for b in (closed_breakdown or []) if b[4]]  # only those with a non-zero коригування
+    if cb:
+        ws.merge_cells(f'A{nxt}:F{nxt}')
+        ws.cell(nxt,1,'КОРИГУВАННЯ (курсова різниця за оплатами)').font=Font(name='Arial',bold=True,size=10,color='FFFFFF')
+        ws.cell(nxt,1).fill=PatternFill('solid',fgColor='1A5276')
+        for c,h in enumerate(['Рахунок','Виторг','Курс 1-ї опл.','Курс зваж.','Коригування','Прибуток'],1):
+            cell=ws.cell(nxt+1,c,h)
+            cell.font=Font(name='Arial',bold=True,size=9,color='FFFFFF')
+            cell.fill=PatternFill('solid',fgColor='2C3E50'); cell.border=brd
+        rr=nxt+2
+        for inv,rev,fr,wr,kor,pr in cb:
+            for c,v in enumerate([f'рах.{inv}', round(rev,2), round(fr,4), round(wr,4), round(kor,2), round(pr,2)],1):
+                cell=ws.cell(rr,c,v); cell.font=Font(name='Arial',size=9); cell.border=brd
+                if c in [2,3,4,5,6]: cell.number_format='#,##0.00'
+            rr+=1
+        nxt = rr + 1
+
+    # Open (partially paid) invoices — NOT in salary
+    oi = open_invoices or []
+    if oi:
+        ws.merge_cells(f'A{nxt}:E{nxt}')
+        ws.cell(nxt,1,'ВІДКРИТІ РАХУНКИ (не повністю оплачені — НЕ в ЗП)').font=Font(name='Arial',bold=True,size=10,color='FFFFFF')
+        ws.cell(nxt,1).fill=PatternFill('solid',fgColor='922B21')
+        for c,h in enumerate(['Рахунок','Оплачено','Сума рахунку','Залишок'],1):
+            cell=ws.cell(nxt+1,c,h)
+            cell.font=Font(name='Arial',bold=True,size=9,color='FFFFFF')
+            cell.fill=PatternFill('solid',fgColor='C0392B'); cell.border=brd
+        rr=nxt+2
+        for inv,paid,tot in oi:
+            for c,v in enumerate([f'рах.{inv}', round(paid,2), round(tot,2), round(tot-paid,2)],1):
+                cell=ws.cell(rr,c,v); cell.font=Font(name='Arial',size=9); cell.border=brd
+                if c in [2,3,4]: cell.number_format='#,##0.00'
+                cell.fill=PatternFill('solid',fgColor='FDEDEC')
+            rr+=1
 
     path = str(DATA_DIR/f"salary_{manager_name}_{month}.xlsx")
     wb.save(path)
@@ -1676,36 +1979,57 @@ async def cmd_oplata(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`Оплати за 29/05/26 «...»`\n"
         "`1. КЛІЄНТ рах.834 – 64 531,20`\n"
         "`2. КЛІЄНТ рах.835 – 33 799,20`\n\n"
-        "Можна одразу кілька днів підряд. Дата з заголовка прив'язується до всіх рах. під ним.",
+        "Сума важлива: бот рахує часткові оплати. Рахунок «закрито», коли оплачено ≥ суми рахунку; "
+        "курс для собівартості — зважений за датами/сумами оплат.",
         parse_mode="Markdown"
     )
     return WAIT_PAYMENTS
 
-async def _finish_payments(update, new_dates: dict):
-    if not new_dates:
+async def _finish_payments(update, tranches: list):
+    if not tranches:
         await update.message.reply_text(
             "❌ Не знайшов жодного рядка. Перевір формат: заголовок «Оплати за ДД/ММ/РР» "
-            "і рядки з `рах.НОМЕР`.",
+            "і рядки з `рах.НОМЕР – СУМА`.",
             parse_mode="Markdown"
         )
         return
-    _merge_payment_dates(new_dates)
-    sample = list(new_dates.items())[:8]
-    lines = [f"✅ *Оплати збережено:* {len(new_dates)} рах."]
-    for inv, d in sample:
-        lines.append(f"• рах.{inv} → {d}")
-    if len(new_dates) > len(sample):
-        lines.append(f"…та ще {len(new_dates) - len(sample)}")
-    lines.append(f"\n📦 Всього в базі оплат: {len(PAYMENT_DATES)}")
-    lines.append("\nПри обробці PDF бот візьме найранішу з двох дат (таблиця / оплата).")
+    _ensure_payments_loaded()
+    # Compute rate per tranche date (archive → Minfin → NBU)
+    rate_cache = {}
+    for t in tranches:
+        d = t["date"]
+        if d not in rate_cache:
+            rate_cache[d] = await get_nbu_rate(d) or 0.0
+        t["rate"] = rate_cache[d]
+
+    added = _merge_payment_tranches(tranches)
+
+    # Persist to the durable 'Оплати' tab (with accumulation + status vs invoice total)
+    revenue_map = invoice_revenue_map_all()
+    sheet_ok = _write_payments_sheet(revenue_map)
+
+    invs = sorted({t["inv"] for t in tranches}, key=lambda x: (len(x), x))
+    lines = [f"✅ *Оплати збережено:* +{added} трансакцій по {len(invs)} рах."]
+    for inv in invs[:8]:
+        paid = total_paid(inv)
+        tot = revenue_map.get(inv, 0)
+        if tot > 0:
+            st = "закрито" if paid >= tot * 0.995 else "часткова"
+            lines.append(f"• рах.{inv}: оплачено {paid:,.0f} з {tot:,.0f} — {st}".replace(",", " "))
+        else:
+            lines.append(f"• рах.{inv}: оплачено {paid:,.0f} (сума рах. ще невідома)".replace(",", " "))
+    if len(invs) > 8:
+        lines.append(f"…та ще {len(invs) - 8} рах.")
+    lines.append("\n📊 Вкладка *Оплати* оновлена ✓" if sheet_ok else "\n⚠️ Google Sheets недоступний (збережено локально)")
+    lines.append("Курс для закритих рахунків — зважений за сумами оплат. Частково оплачені в ЗП не йдуть.")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def handle_payments_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return ConversationHandler.END
     text = update.message.text or ""
-    new_dates = _parse_payment_text(text)
-    await _finish_payments(update, new_dates)
+    tranches = _parse_payment_text(text)
+    await _finish_payments(update, tranches)
     return ConversationHandler.END
 
 async def handle_payments_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1733,9 +2057,9 @@ async def handle_payments_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         text_lines.append(ln)
         os.remove(xlsx_path)
 
-        new_dates = _parse_payment_text("\n".join(text_lines))
+        tranches = _parse_payment_text("\n".join(text_lines))
         await msg.delete()
-        await _finish_payments(update, new_dates)
+        await _finish_payments(update, tranches)
     except Exception as e:
         logger.error(f"oplata excel error: {e}")
         await msg.edit_text(f"❌ Помилка: {e}")
