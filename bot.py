@@ -69,6 +69,13 @@ try:
 except:
     PAYMENT_DATES: dict = {}
 
+# Invoice-level meta from orders table: "invoice_num" -> {manager, pay_date, supplier}
+try:
+    with open("invoice_meta.json", encoding="utf-8") as f:
+        INVOICE_META: dict = json.load(f)
+except:
+    INVOICE_META: dict = {}
+
 def get_rate_from_archive(date_str: str) -> float:
     """Get EUR buy rate from local archive, return 0 if not found"""
     return float(RATES.get(date_str, 0))
@@ -878,30 +885,43 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not_found:
         lines.append(f"⚠️ Не знайдено ({len(not_found)}): {', '.join(not_found)}")
 
-    # ── Date & rate logic ────────────────────────────────────────────────────
-    # Two possible date sources for THIS invoice:
-    #   table_date — confirmation date from invoice_lookup (orders table)
-    #   pay_date   — actual client payment date loaded via /oplata
-    # Rule: use the EARLIEST of the two (handles post-pay + double-check).
-    table_date = ""
+    # ── Date / rate / manager logic ──────────────────────────────────────────
+    # Date sources for THIS invoice:
+    #   table_pay     — "Дата оплати клієнта" (AA) from orders table  ← PRIORITY
+    #   oplata_pay    — actual payment date loaded via /oplata (double-check)
+    #   table_confirm — "Дата підтвердження замовлення" (V), fallback only
+    # Rule: rate date = EARLIEST of (table_pay, oplata_pay); else order-confirm date.
+    table_pay = ""
+    table_confirm = ""
+    auto_manager = ""
     if inv_number:
+        meta = INVOICE_META.get(inv_number, {})
+        table_pay = meta.get("pay_date", "") or ""
+        auto_manager = meta.get("manager", "") or ""
         for item in parsed["items"]:
-            inv_key = f"{inv_number}:{item['article']}"
-            if inv_key in INVOICE_LOOKUP:
-                rec = INVOICE_LOOKUP[inv_key]
-                d = rec.get("confirm_date", "")
-                if d:
-                    table_date = d
-                    break
+            rec = INVOICE_LOOKUP.get(f"{inv_number}:{item['article']}")
+            if rec:
+                if not table_pay:     table_pay = rec.get("pay_date", "") or ""
+                if not table_confirm: table_confirm = rec.get("confirm_date", "") or ""
+                if not auto_manager:  auto_manager = rec.get("manager", "") or ""
 
-    pay_date = get_payment_date(inv_number)
-    auto_date = _earliest_date(table_date, pay_date)
+    oplata_pay = get_payment_date(inv_number)
+    pay_eff = _earliest_date(table_pay, oplata_pay)
+    auto_date = pay_eff or table_confirm
+
+    ctx.user_data["pending_invoice"]["auto_manager"] = auto_manager
+    if auto_manager:
+        lines.append(f"👤 Менеджер (з таблиці): *{auto_manager}*")
 
     # Note explaining which date was chosen
-    if table_date and pay_date and table_date != pay_date:
-        date_note = f" _(найраніша з: таблиця {table_date} / оплата {pay_date})_"
-    elif pay_date and not table_date:
-        date_note = " _(дата фактичної оплати з /oplata)_"
+    if table_pay and oplata_pay and table_pay != oplata_pay:
+        date_note = f" _(найраніша з: таблиця {table_pay} / оплата {oplata_pay})_"
+    elif oplata_pay and not table_pay:
+        date_note = " _(дата оплати з /oplata)_"
+    elif table_pay:
+        date_note = " _(дата оплати з таблиці)_"
+    elif table_confirm:
+        date_note = " _(дата підтвердження замовлення)_"
     else:
         date_note = ""
 
@@ -1052,9 +1072,14 @@ async def save_invoice(query, ctx: ContextTypes.DEFAULT_TYPE):
     user.setdefault("invoices", []).append(inv)
     save_user(uid, user)
 
-    manager_name = user.get("name", str(uid))
+    # Manager: prefer the one detected from the orders table (by invoice number),
+    # so the invoice lands in the right manager's sheet regardless of who sent the PDF.
+    auto_manager = inv.get("auto_manager", "")
+    manager_name = auto_manager or user.get("name", str(uid))
     sheet_ok = append_to_sheets(manager_name, inv)
     sheet_msg = "📊 Записано в Google Sheets ✓" if sheet_ok else "⚠️ Google Sheets недоступний"
+    if auto_manager and auto_manager != user.get("name", ""):
+        sheet_msg += f"\n👤 Лист менеджера: *{auto_manager}* (з таблиці)"
 
     ctx.user_data.pop("pending_invoice", None)
     ctx.user_data.pop("stock_selected", None)
@@ -1193,7 +1218,7 @@ def build_excel_from_rows(manager_name, rows, month, delivery, total_revenue, to
     ws.row_dimensions[1].height = 26
 
     headers = ['Клієнт','Рахунок','Дата','Артикул','Кть','Закуп EUR','Курс',
-               'Ціна UAH','Виторг','Прибуток S','Надбавка T','Склад?']
+               'Ціна UAH','Виторг','Прибуток S','Надбавка T','Склад?','Постачальник']
     ws.row_dimensions[2].height = 30
     for c,h in enumerate(headers,1):
         cell = ws.cell(2,c,h)
@@ -1201,7 +1226,7 @@ def build_excel_from_rows(manager_name, rows, month, delivery, total_revenue, to
         cell.fill = PatternFill('solid',fgColor='2C3E50')
         cell.alignment = Alignment(horizontal='center',vertical='center',wrap_text=True)
         cell.border = brd
-    for i,w in enumerate([18,20,11,22,5,10,8,12,13,13,13,8],1):
+    for i,w in enumerate([18,20,11,22,5,10,8,12,13,13,13,8,24],1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     def num(v):
@@ -1211,9 +1236,10 @@ def build_excel_from_rows(manager_name, rows, month, delivery, total_revenue, to
     row = 3
     for r in rows:
         is_stock = (len(r) > 15 and r[15] == "так")
+        supplier = r[24] if len(r) > 24 else ""
         vals = [r[1], r[2], r[3], r[4], num(r[5]), num(r[6]), num(r[8]),
                 num(r[11]), num(r[12]), num(r[13]), num(r[14]),
-                "так" if is_stock else ""]
+                "так" if is_stock else "", supplier]
         for c,v in enumerate(vals,1):
             cell = ws.cell(row,c,v)
             cell.font = Font(name='Arial',size=9)
@@ -1425,6 +1451,7 @@ async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         new_lookup = {}
         new_invoice_lookup = {}
         new_stock_lookup = {}
+        new_invoice_meta = {}
 
         for sheet in sheets:
             try:
@@ -1447,6 +1474,8 @@ async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             weight_i = find_col(['нетто за 1', 'вага'])
             brand_i = find_col(['виробник', 'brand'])
             supplier_i = find_col(['постачальник', 'поставщик', 'supplier'])
+            manager_i = find_col(['менеджер', 'manager'])
+            paydate_i = find_col(['дата оплати клієнт', 'дата оплати', 'дата оплаты'])
             date_i = find_col(['дата підтвердження'])
             inv_col_name = invoice_col_names.get(sheet, '№ Рахунку')
             invoice_i = find_col([inv_col_name])
@@ -1472,9 +1501,29 @@ async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 try: brand = str(row.iloc[brand_i]).strip() if brand_i >= 0 else ''
                 except: brand = ''
                 brand = '' if brand == 'nan' else brand
-                try: supplier = str(row.iloc[supplier_i]).strip() if supplier_i >= 0 else ''
+                try: supplier = str(row.iloc[supplier_i]) if supplier_i >= 0 else ''
                 except: supplier = ''
+                # strip openpyxl control-char escapes (_x000D_, _x0002_ ...) and collapse spaces
+                supplier = re_up.sub(r'_x[0-9A-Fa-f]{4}_', ' ', supplier)
+                supplier = re_up.sub(r'\s+', ' ', supplier).strip()
                 supplier = '' if supplier in ('nan', 'NaN', 'None', '') else shorten_company(supplier)
+
+                # Manager (skip "Склад" placeholder)
+                try: manager = str(row.iloc[manager_i]).strip() if manager_i >= 0 else ''
+                except: manager = ''
+                if manager in ('nan', 'NaN', 'None', '') or 'склад' in manager.lower():
+                    manager = ''
+
+                # Client payment date (AA) — actual date client paid
+                pay_date = ''
+                pay_obj = None
+                if paydate_i >= 0:
+                    try:
+                        pd_v = row.iloc[paydate_i]
+                        if pd.notna(pd_v) and hasattr(pd_v, 'strftime'):
+                            pay_date = pd_v.strftime('%d.%m.%Y')
+                            pay_obj = pd_v
+                    except: pass
 
                 date_str = ''
                 date_obj = None
@@ -1490,7 +1539,7 @@ async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 is_storage = 'склад' in inv_raw.lower()
                 inv_num = ''
                 if not is_storage:
-                    m = re_up.search(r'№\s*(\d+)', inv_raw)
+                    m = re_up.search(r'(?:№|No|#)\s*(\d+)', inv_raw, re_up.IGNORECASE)
                     if m: inv_num = m.group(1)
 
                 record = {
@@ -1504,6 +1553,8 @@ async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     'invoice_num': inv_num,
                     'is_storage': is_storage,
                     'supplier': supplier,
+                    'manager': manager,
+                    'pay_date': pay_date,
                 }
 
                 # Stock lookup
@@ -1526,6 +1577,38 @@ async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if key not in new_invoice_lookup or (price > 0 and new_invoice_lookup[key].get('cost_eur', 0) == 0):
                         new_invoice_lookup[key] = record
 
+                # Invoice-level meta (manager / pay_date / supplier) keyed by invoice number.
+                # On number collision across years keep the record with the LATEST date.
+                if inv_num:
+                    try:
+                        cand = pay_obj or date_obj
+                        cand_dt = cand.to_pydatetime() if hasattr(cand, 'to_pydatetime') else cand
+                    except:
+                        cand_dt = None
+                    cur = new_invoice_meta.get(inv_num)
+                    if cur is None:
+                        new_invoice_meta[inv_num] = {
+                            'manager': manager, 'pay_date': pay_date,
+                            'supplier': supplier, '_dt': cand_dt,
+                        }
+                    else:
+                        newer = False
+                        try:
+                            newer = bool(cand_dt) and (cur.get('_dt') is None or cand_dt > cur['_dt'])
+                        except:
+                            newer = False
+                        if newer:
+                            new_invoice_meta[inv_num] = {
+                                'manager': manager or cur.get('manager', ''),
+                                'pay_date': pay_date or cur.get('pay_date', ''),
+                                'supplier': supplier or cur.get('supplier', ''),
+                                '_dt': cand_dt,
+                            }
+                        else:
+                            if not cur.get('manager') and manager: cur['manager'] = manager
+                            if not cur.get('pay_date') and pay_date: cur['pay_date'] = pay_date
+                            if not cur.get('supplier') and supplier: cur['supplier'] = supplier
+
                 # General lookup
                 existing = new_lookup.get(art, {})
                 if price > 0 or not existing:
@@ -1536,7 +1619,13 @@ async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         os_mod.remove(xlsx_path)
 
-        # Save all 3 files
+        # Strip internal sort key before saving meta
+        clean_meta = {
+            k: {kk: vv for kk, vv in v.items() if kk != '_dt'}
+            for k, v in new_invoice_meta.items()
+        }
+
+        # Save all files
         import json as json_mod
         with open('lookup.json', 'w', encoding='utf-8') as f:
             json_mod.dump(new_lookup, f, ensure_ascii=False, indent=2)
@@ -1544,17 +1633,24 @@ async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             json_mod.dump(new_invoice_lookup, f, ensure_ascii=False, indent=2)
         with open('stock_lookup.json', 'w', encoding='utf-8') as f:
             json_mod.dump(new_stock_lookup, f, ensure_ascii=False, indent=2)
+        with open('invoice_meta.json', 'w', encoding='utf-8') as f:
+            json_mod.dump(clean_meta, f, ensure_ascii=False, indent=2)
 
         # Update in-memory
         LOOKUP.clear(); LOOKUP.update(new_lookup)
         INVOICE_LOOKUP.clear(); INVOICE_LOOKUP.update(new_invoice_lookup)
         STOCK_LOOKUP.clear(); STOCK_LOOKUP.update(new_stock_lookup)
+        INVOICE_META.clear(); INVOICE_META.update(clean_meta)
 
+        meta_with_date = sum(1 for v in clean_meta.values() if v.get('pay_date'))
+        meta_with_mgr = sum(1 for v in clean_meta.values() if v.get('manager'))
         await msg.edit_text(
             f"✅ *Довідники оновлено!*\n\n"
             f"📦 Артикулів: *{len(new_lookup)}*\n"
             f"📄 По рахунках: *{len(new_invoice_lookup)}*\n"
             f"📦 Склад: *{len(new_stock_lookup)}*\n"
+            f"👤 Рахунків з менеджером: *{meta_with_mgr}*\n"
+            f"💸 Рахунків з датою оплати: *{meta_with_date}*\n"
             f"📋 Аркушів: {len(sheets)} ({', '.join(sheets[:3])})",
             parse_mode="Markdown"
         )
