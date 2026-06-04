@@ -62,26 +62,12 @@ try:
 except:
     RATES: dict = {}
 
-# Client payments per invoice (supports partial payments / tranches):
-#   "invoice_num" -> [ {"date": "DD.MM.YYYY", "amount": float, "rate": float}, ... ]
-try:
-    with open("payments.json", encoding="utf-8") as f:
-        PAYMENTS: dict = json.load(f)
-except:
-    PAYMENTS: dict = {}
-
-# Backward-compat: migrate old payment_dates.json ({inv: "date"}) into tranche form
+# Actual client payment dates: "invoice_num" -> ["DD.MM.YYYY", ...] (list of tranches)
 try:
     with open("payment_dates.json", encoding="utf-8") as f:
-        _old_pd = json.load(f)
-    for _inv, _d in _old_pd.items():
-        _inv = str(_inv).strip()
-        if _inv not in PAYMENTS and isinstance(_d, str) and _d:
-            PAYMENTS[_inv] = [{"date": _d, "amount": 0.0, "rate": 0.0}]
+        PAYMENT_DATES: dict = json.load(f)
 except:
-    pass
-
-_payments_loaded_from_sheet = False  # lazy-load guard (durable store = Google tab)
+    PAYMENT_DATES: dict = {}
 
 # Invoice-level meta from orders table: "invoice_num" -> {manager, pay_date, supplier}
 try:
@@ -90,76 +76,37 @@ try:
 except:
     INVOICE_META: dict = {}
 
-# Invoice totals (виторг) captured at PDF-processing time: "65" -> revenue_uah.
-# This is the SOURCE OF TRUTH for «Сума рахунку», so we never have to guess it
-# from the «ВСІ» sheet (which failed for older invoices).
-try:
-    with open("invoice_totals.json", encoding="utf-8") as f:
-        INVOICE_TOTALS: dict = json.load(f)
-except:
-    INVOICE_TOTALS: dict = {}
-
-def _save_invoice_totals():
-    try:
-        with open("invoice_totals.json", "w", encoding="utf-8") as f:
-            json.dump(INVOICE_TOTALS, f, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"save invoice_totals error: {e}")
-
-def _inv_num(invoice_num_str: str) -> str:
-    """Extract the bare invoice number ('65') from 'Рахунок №65 від ...'."""
-    m = re.search(r"[№#No]+\s*(\d+)", str(invoice_num_str))
-    return m.group(1) if m else ""
-
 def get_rate_from_archive(date_str: str) -> float:
     """Get EUR buy rate from local archive, return 0 if not found"""
     return float(RATES.get(date_str, 0))
 
-def get_payments(inv_num: str) -> list:
-    """All payment tranches for an invoice number, or [] if none."""
+def _as_date_list(val) -> list:
+    """Normalize a PAYMENT_DATES value (str old-format OR list) to a sorted unique list."""
+    if not val:
+        return []
+    if isinstance(val, str):
+        val = [val]
+    out = []
+    for d in val:
+        d = str(d).strip()
+        if d and d not in out:
+            out.append(d)
+    try:
+        out.sort(key=lambda x: datetime.strptime(x, "%d.%m.%Y"))
+    except:
+        pass
+    return out
+
+def get_payment_dates(inv_num: str) -> list:
+    """All actual client payment dates (tranches) for an invoice, sorted ascending."""
     if not inv_num:
         return []
-    return PAYMENTS.get(str(inv_num).strip(), []) or []
+    return _as_date_list(PAYMENT_DATES.get(str(inv_num).strip()))
 
 def get_payment_date(inv_num: str) -> str:
-    """EARLIEST tranche date for an invoice number, or '' if none."""
-    tr = get_payments(inv_num)
-    dates = [t.get("date", "") for t in tr if t.get("date")]
-    return _earliest_date(*dates) if dates else ""
-
-def total_paid(inv_num: str) -> float:
-    return round(sum(float(t.get("amount", 0) or 0) for t in get_payments(inv_num)), 2)
-
-def weighted_rate(inv_num: str) -> float:
-    """Payment-amount-weighted rate across tranches; 0 if not computable."""
-    tr = [t for t in get_payments(inv_num)
-          if float(t.get("amount", 0) or 0) > 0 and float(t.get("rate", 0) or 0) > 0]
-    if not tr:
-        return 0.0
-    num = sum(float(t["amount"]) * float(t["rate"]) for t in tr)
-    den = sum(float(t["amount"]) for t in tr)
-    return round(num / den, 4) if den else 0.0
-
-def blended_rate(inv_num: str) -> float:
-    """EQUAL-share blend of tranche rates — matches the manual formula
-    (EUR/2 × курс1) + (EUR/2 × курс2): each payment date weighs the same,
-    regardless of its amount. For N tranches it's the simple average."""
-    rates = [round(float(t.get("rate", 0) or 0), 4)
-             for t in get_payments(inv_num) if float(t.get("rate", 0) or 0) > 0]
-    if not rates:
-        return 0.0
-    return round(sum(rates) / len(rates), 4)
-
-def first_payment_rate(inv_num: str) -> float:
-    """Rate of the earliest-dated tranche (the base rate the invoice was priced at)."""
-    tr = [t for t in get_payments(inv_num) if t.get("date")]
-    if not tr:
-        return 0.0
-    tr = sorted(tr, key=lambda x: _dt(x.get("date", "")))
-    for t in tr:
-        if float(t.get("rate", 0) or 0) > 0:
-            return round(float(t["rate"]), 4)
-    return 0.0
+    """Earliest client payment date for an invoice number, or '' if none."""
+    dates = get_payment_dates(inv_num)
+    return dates[0] if dates else ""
 
 def _earliest_date(*dates) -> str:
     """Return earliest of given DD.MM.YYYY dates (ignores blanks)."""
@@ -171,15 +118,15 @@ def _earliest_date(*dates) -> str:
     except:
         return valid[0]
 
-def _parse_payment_text(text: str) -> list:
-    """Parse Teams-style payment text into tranches.
+def _parse_payment_text(text: str) -> dict:
+    """Parse Teams-style payment text.
 
     Header line:  Оплати за ДД/ММ/РР «...»
     Item lines:   1. КЛІЄНТ рах.834 – 64 531,20
     Header date binds to every рах.НОМЕР below it until the next header.
-    Returns list of {"inv": "834", "date": "DD.MM.YYYY", "amount": float}.
+    Returns {invoice_num: ["DD.MM.YYYY", ...]} — keeps ALL tranche dates.
     """
-    out: list = []
+    result: dict = {}
     cur_date = ""
     for line in text.splitlines():
         h = re.search(
@@ -196,63 +143,24 @@ def _parse_payment_text(text: str) -> list:
                 cur_date = ""
             continue
         if cur_date:
-            # рах.НОМЕР  optionally followed by  – СУМА
-            for m in re.finditer(
-                r"рах\.?\s*№?\s*(\d+)\s*(?:[–—\-:]\s*([\d][\d\s.,]*))?",
-                line, re.IGNORECASE
-            ):
+            for m in re.finditer(r"рах\.?\s*№?\s*(\d+)", line, re.IGNORECASE):
                 inv = m.group(1)
-                amount = 0.0
-                if m.group(2):
-                    try:
-                        s = m.group(2).replace(" ", "").replace("\xa0", "")
-                        if s.count(",") and s.count("."):
-                            s = s.replace(".", "").replace(",", ".")
-                        else:
-                            s = s.replace(",", ".")
-                        amount = float(s)
-                    except:
-                        amount = 0.0
-                out.append({"inv": inv, "date": cur_date, "amount": amount})
-    return out
+                result.setdefault(inv, [])
+                if cur_date not in result[inv]:
+                    result[inv].append(cur_date)
+    return result
 
-def _save_payments():
+def _merge_payment_dates(new_dates: dict):
+    """Merge new payment dates into PAYMENT_DATES. Keep ALL tranche dates (unique, sorted)."""
+    for inv, dates in new_dates.items():
+        inv = str(inv).strip()
+        merged = _as_date_list(PAYMENT_DATES.get(inv)) + _as_date_list(dates)
+        PAYMENT_DATES[inv] = _as_date_list(merged)
     try:
-        with open("payments.json", "w", encoding="utf-8") as f:
-            json.dump(PAYMENTS, f, ensure_ascii=False, indent=2)
+        with open("payment_dates.json", "w", encoding="utf-8") as f:
+            json.dump(PAYMENT_DATES, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error(f"payments save error: {e}")
-
-def _merge_payment_tranches(tranches: list) -> int:
-    """Merge tranches (each {inv,date,amount,rate}) into PAYMENTS.
-    Dedupe identical (date, amount) for the same invoice. Returns count added."""
-    added = 0
-    for t in tranches:
-        inv = str(t["inv"]).strip()
-        lst = PAYMENTS.setdefault(inv, [])
-        new_rate = round(float(t.get("rate", 0) or 0), 4)
-        existing = None
-        for x in lst:
-            if x.get("date") == t["date"] and round(float(x.get("amount", 0) or 0), 2) == round(float(t.get("amount", 0) or 0), 2):
-                existing = x
-                break
-        if existing is not None:
-            # Same date+amount already stored: refresh the rate if a fresh valid
-            # one is available (fixes old tranches frozen at a wrong 52,72 курс).
-            if new_rate > 0 and round(float(existing.get("rate", 0) or 0), 4) != new_rate:
-                existing["rate"] = new_rate
-            continue
-        lst.append({"date": t["date"], "amount": round(float(t.get("amount", 0) or 0), 2),
-                    "rate": new_rate})
-        added += 1
-    # keep tranches sorted by date
-    for inv, lst in PAYMENTS.items():
-        try:
-            lst.sort(key=lambda x: datetime.strptime(x.get("date", "01.01.1900"), "%d.%m.%Y"))
-        except:
-            pass
-    _save_payments()
-    return added
+        logger.error(f"payment_dates save error: {e}")
 
 def get_price(art: str) -> float:
     return PRICE_LOOKUP.get(art, 0)
@@ -262,7 +170,7 @@ def shorten_company(name: str) -> str:
     if not name:
         return name
     name = name.strip()
-    
+
     replacements = [
         # Full forms -> abbreviations
         ('ТОВАРИСТВО З ОБМЕЖЕНОЮ ВІДПОВІДАЛЬНІСТЮ', 'ТОВ'),
@@ -280,18 +188,18 @@ def shorten_company(name: str) -> str:
         ('ПРИВАТНЕ ПІДПРИЄМСТВО', 'ПП'),
         ('Приватне підприємство', 'ПП'),
     ]
-    
+
     for full, short in replacements:
         if full in name:
             name = name.replace(full, short).strip()
             break
-    
+
     # Remove quotes around company name
     import re as re_co
     name = re_co.sub(r'[\u0022\u201c\u201d\u00ab\u00bb\u2018\u2019]', '', name).strip()
     # Remove extra spaces
     name = ' '.join(name.split())
-    
+
     return name
 
 ORDERS_SHEET_ID = os.environ.get("ORDERS_SHEET_ID", "")
@@ -392,7 +300,7 @@ def get_or_create_ws(spreadsheet, name: str):
     except gspread.WorksheetNotFound:
         pass
     try:
-        ws = spreadsheet.add_worksheet(title=name, rows=500, cols=20)
+        ws = spreadsheet.add_worksheet(title=name, rows=500, cols=30)
     except gspread.exceptions.APIError as e:
         if "already exists" in str(e):
             return spreadsheet.worksheet(name)
@@ -404,7 +312,7 @@ def get_or_create_ws(spreadsheet, name: str):
                "Прибуток (S)","Надбавка (T)","Склад?",
                "УКТЗЕД","Бренд","Джерело",
                "Прайс EUR","Вага/шт","Вага Китай","Вага Європа","Додано","Постачальник",
-               "Курс опл.1","Курс опл.2","Курс опл.3"]
+               "Курс 1","Курс 2","Курс 3"]
     ws.append_row(headers)
     ws.format("A1:AB1", {
         "backgroundColor": {"red":0.17,"green":0.18,"blue":0.24},
@@ -419,7 +327,6 @@ def append_to_sheets(manager_name: str, inv: dict):
         sh = get_gsheet()
         if not sh:
             return False
-        _ensure_payments_loaded()
         ws_mgr = get_or_create_ws(sh, manager_name)
         ws_all = get_or_create_ws(sh, "ВСІ")
 
@@ -428,13 +335,16 @@ def append_to_sheets(manager_name: str, inv: dict):
         invoice_num = inv.get("invoice_num", "")
         date = inv.get("date", "")
         items = inv.get("items", [])
+        # Per-payment RAW interbank rates (without markup). [] / 1 elem => single-rate.
+        pay_rates = [r for r in inv.get("pay_rates", []) if r]
+        n_pay = len(pay_rates)
+        # Markup factor written WITHOUT a decimal literal to dodge sheet-locale issues:
+        # RATE_MARKUP=2  ->  "(1+2/100)" == 1.02
+        mk = RATE_MARKUP
+        mk_str = str(int(mk)) if mk == int(mk) else str(mk)
         import re as re_sh
         m_sh = re_sh.search(r"[№#No]+\s*(\d+)", invoice_num)
         inv_number = m_sh.group(1) if m_sh else ""
-
-        # Payment-date rates for this invoice (equal-split blend = manual /2 logic)
-        pay_rates = [round(float(t.get("rate", 0) or 0), 2)
-                     for t in get_payments(inv_number) if float(t.get("rate", 0) or 0) > 0][:3]
 
         # Get current row count
         existing = ws_mgr.get_all_values()
@@ -444,19 +354,20 @@ def append_to_sheets(manager_name: str, inv: dict):
         rows_to_write = []
         format_requests = []
         all_sheet_rows = []  # for ВСІ
+        NCOLS = 28  # A..AB
 
         # Separator row (if not first entry)
         if start_row > 2:
-            rows_to_write.append([""] * 28)
+            rows_to_write.append([""] * NCOLS)
             format_requests.append({
                 "range": f"A{start_row}:AB{start_row}",
                 "format": {"backgroundColor": {"red": 0.85, "green": 0.91, "blue": 0.97}}
             })
-            all_sheet_rows.append([""] * 28)
+            all_sheet_rows.append([""] * NCOLS)
             start_row += 1
 
         # Invoice header row
-        header = [manager_name, client, invoice_num, date] + [""] * 24
+        header = [manager_name, client, invoice_num, date] + [""] * (NCOLS - 4)
         rows_to_write.append(header)
         format_requests.append({
             "range": f"A{start_row}:AB{start_row}",
@@ -481,30 +392,36 @@ def append_to_sheets(manager_name: str, inv: dict):
             duty_pct = round(duty * 100, 1)
             r = start_row
 
+            # ── Cost UAH/unit (J) ────────────────────────────────────────────
+            # Multi-payment: split EUR into EQUAL shares, each share × (1+мито) ×
+            # interbank rate of ITS payment date × markup. Exactly the manual form:
+            #   =(G/2*(1+H/100)*Курс1*(1+2/100))+(G/2*(1+H/100)*Курс2*(1+2/100))
+            # Rate columns: Z=Курс1, AA=Курс2, AB=Курс3 (RAW interbank).
+            rate_cols = ["Z", "AA", "AB"]
+            if n_pay >= 2:
+                terms = [
+                    f"(G{r}/{n_pay}*(1+H{r}/100)*{rate_cols[i]}{r}*(1+{mk_str}/100))"
+                    for i in range(min(n_pay, 3))
+                ]
+                cost_formula = "=" + "+".join(terms)
+                rate_cell = ""  # single Курс not used for cost when split
+            else:
+                cost_formula = f"=G{r}*(1+H{r}/100)*I{r}"
+                rate_cell = round(rate, 2) if rate else ""
+
+            # Stock S/T formulas need a single курс (I) to value the price list.
+            # For split invoices give stock rows the equal-share blended курс
+            # (this курс is ONLY for the manager-markup baseline, NOT себестоимість).
+            if is_stock and n_pay >= 2:
+                blended = round(sum(pay_rates) / n_pay * (1 + mk / 100), 2)
+                rate_cell = blended
+
             if is_stock:
                 fn = f"=M{r}-T{r}*I{r}*F{r}"
                 fo = f"=(M{r}-K{r})-N{r}"
             else:
                 fn = f"=M{r}-K{r}"
                 fo = "=0"
-
-            base_rate_cell = round(rate, 2) if rate else ""
-            n_pay = len(pay_rates)
-            # payment-rate cells Z/AA/AB (up to 3)
-            z = pay_rates[0] if n_pay > 0 else ""
-            aa = pay_rates[1] if n_pay > 1 else ""
-            ab = pay_rates[2] if n_pay > 2 else ""
-            # Курс = середнє курсів оплат (рівні частки, як руками /2, /3).
-            # ВАЖЛИВО: тільки чиста арифметика, БЕЗ коми-аргументів (AVERAGE/IFERROR),
-            # бо укр. локаль Google Sheets має роздільник ';' і ламає такі формули у #ERROR!.
-            if n_pay >= 3:
-                i_cell = f"=(Z{r}+AA{r}+AB{r})/3"
-            elif n_pay == 2:
-                i_cell = f"=(Z{r}+AA{r})/2"
-            elif n_pay == 1:
-                i_cell = f"=Z{r}"
-            else:
-                i_cell = base_rate_cell   # немає оплат → базовий курс числом
 
             row = [
                 "",                                              # A Менеджер
@@ -515,8 +432,8 @@ def append_to_sheets(manager_name: str, inv: dict):
                 item["qty"],                                     # F Кть
                 round(cost_eur, 2),                              # G Закуп EUR
                 duty_pct,                                        # H Мито%
-                i_cell,                                          # I Курс (СРЗНАЧ оплат)
-                f"=G{r}*(1+H{r}/100)*I{r}",                      # J Собів UAH/шт
+                rate_cell,                                       # I Курс (single) / blended for stock
+                cost_formula,                                    # J Собів UAH/шт
                 f"=J{r}*F{r}",                                   # K Собів загал
                 item["price_uah"],                               # L Ціна прод
                 f"=L{r}*F{r}",                                   # M Виторг
@@ -532,9 +449,9 @@ def append_to_sheets(manager_name: str, inv: dict):
                 round(weight_unit * item["qty"], 3) if (is_stock and "trade" in source.lower()) else 0,  # W Вага Європа
                 datetime.now().strftime("%d.%m.%Y %H:%M"),       # X Додано
                 lu.get("supplier", ""),                          # Y Постачальник
-                z,                                               # Z Курс опл.1
-                aa,                                              # AA Курс опл.2
-                ab,                                              # AB Курс опл.3
+                round(pay_rates[0], 4) if n_pay >= 1 else "",    # Z Курс 1 (raw)
+                round(pay_rates[1], 4) if n_pay >= 2 else "",    # AA Курс 2 (raw)
+                round(pay_rates[2], 4) if n_pay >= 3 else "",    # AB Курс 3 (raw)
             ]
             rows_to_write.append(row)
             all_sheet_rows.append(row)
@@ -558,10 +475,13 @@ def append_to_sheets(manager_name: str, inv: dict):
 
         # Number formatting for data rows
         num_format = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}
+        rate_format = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.0000"}}
         data_start = first_row + (2 if existing and len(existing) > 1 else 1)
         if data_start <= last_row:
-            for col in ["G", "H", "I", "J", "K", "L", "M", "N", "O", "T", "U", "V", "W", "Z", "AA", "AB"]:
+            for col in ["G", "H", "I", "J", "K", "L", "M", "N", "O", "T", "U", "V", "W"]:
                 batch_formats.append({"range": f"{col}{data_start}:{col}{last_row}", "format": num_format})
+            for col in ["Z", "AA", "AB"]:
+                batch_formats.append({"range": f"{col}{data_start}:{col}{last_row}", "format": rate_format})
 
         # Stock article cells - red
         stock_fmt = {
@@ -608,15 +528,19 @@ def save_user(uid, data):
     _uf(uid).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # ── Currency rate (archive first, then Minfin, then NBU) ─────────────────────
-async def get_nbu_rate(date_str: str):
-    """Get EUR buy rate: archive -> Minfin -> NBU fallback"""
+async def get_nbu_rate(date_str: str, apply_markup: bool = True):
+    """Get EUR buy rate: archive -> Minfin -> NBU fallback.
+    apply_markup=False returns the RAW interbank rate (no RATE_MARKUP)."""
     import re as re_rate
+
+    def _fin(raw: float):
+        return round(raw * (1 + RATE_MARKUP / 100), 2) if apply_markup else round(raw, 4)
 
     # ── Method 0: Local rates archive (most accurate) ─────────────────────────
     archived = get_rate_from_archive(date_str)
     if archived > 0:
-        final = round(archived * (1 + RATE_MARKUP / 100), 2)
-        logger.info(f"Archive rate {date_str}: {archived} -> {final}")
+        final = _fin(archived)
+        logger.info(f"Archive rate {date_str}: {archived} -> {final} (mk={apply_markup})")
         return final
 
     try:
@@ -641,7 +565,7 @@ async def get_nbu_rate(date_str: str):
         if m:
             rate = float(m.group(1).replace(",", "."))
             if 48 < rate < 65:  # EUR/UAH realistic range
-                final = round(rate * (1 + RATE_MARKUP / 100), 2)
+                final = _fin(rate)
                 logger.info(f"Minfin EUR buy {date_str}: {rate} -> {final}")
                 return final
 
@@ -657,7 +581,7 @@ async def get_nbu_rate(date_str: str):
             if m:
                 rate = float(m.group(1))
                 if 48 < rate < 65:
-                    final = round(rate * (1 + RATE_MARKUP / 100), 2)
+                    final = _fin(rate)
                     logger.info(f"Minfin JSON EUR buy {date_str}: {rate} -> {final}")
                     return final
 
@@ -666,7 +590,7 @@ async def get_nbu_rate(date_str: str):
         for b in all_buys:
             rate = float(b)
             if 48 < rate < 65:  # EUR range
-                final = round(rate * (1 + RATE_MARKUP / 100), 2)
+                final = _fin(rate)
                 logger.info(f"Minfin all-buy EUR {date_str}: {rate} -> {final}")
                 return final
 
@@ -675,7 +599,7 @@ async def get_nbu_rate(date_str: str):
         if all_nums:
             rate = float(all_nums[0].replace(",", "."))
             if 48 < rate < 65:
-                final = round(rate * (1 + RATE_MARKUP / 100), 2)
+                final = _fin(rate)
                 logger.info(f"Minfin num EUR {date_str}: {rate} -> {final}")
                 return final
 
@@ -692,41 +616,10 @@ async def get_nbu_rate(date_str: str):
             if data:
                 rate = float(data[0]["rate"])
                 logger.info(f"NBU fallback EUR {date_str}: {rate}")
-                return round(rate * (1 + RATE_MARKUP / 100), 2)
+                return _fin(rate)
     except Exception as e:
         logger.warning(f"NBU fallback error: {e}")
 
-    return None
-
-
-async def get_payment_rate(date_str: str):
-    """Rate for a PAYMENT date — used for 50/50 коригування.
-
-    archive (межбанк, +markup)  →  NBU official by EXACT date (+markup).
-
-    Deliberately does NOT use the greedy Minfin scrape: for dates outside the
-    local archive that scrape grabs the *current* rate (e.g. 52,72 for every
-    old date), which made both tranches identical and zeroed out коригування.
-    NBU is date-accurate, so distinct payment dates get distinct rates.
-    """
-    a = get_rate_from_archive(date_str)
-    if a > 0:
-        return round(a * (1 + RATE_MARKUP / 100), 2)
-    try:
-        dt = datetime.strptime(date_str, "%d.%m.%Y")
-        url = (f"https://bank.gov.ua/NBU_Exchange/exchange_site?"
-               f"start={dt:%Y%m%d}&end={dt:%Y%m%d}&valcode=EUR"
-               f"&sort=exchangedate&order=desc&json")
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
-            data = r.json()
-            if data:
-                rate = float(data[0]["rate"])
-                final = round(rate * (1 + RATE_MARKUP / 100), 2)
-                logger.info(f"Payment rate NBU {date_str}: {rate} -> {final}")
-                return final
-    except Exception as e:
-        logger.warning(f"payment rate error {date_str}: {e}")
     return None
 
 
@@ -788,6 +681,7 @@ def parse_pdf(path: str) -> dict:
 
     # ── Method 2: Generic regex for any article-looking pattern (fallback) ───
     if not result["items"]:
+        seen = set()
         # Match line format: "№ Назва товару АРТИКУЛ qty шт price total"
         # Articles can contain: A-Z, 0-9, -, /, +, ., (, )
         item_pat = re.compile(
@@ -967,7 +861,7 @@ def build_excel(manager_name, invoices, month):
     return path
 
 # ── States ────────────────────────────────────────────────────────────────────
-WAIT_NAME, WAIT_DATE, WAIT_STOCK, WAIT_DELIVERY, WAIT_EXCEL, WAIT_RATES, WAIT_PAYMENTS, WAIT_SUMA = range(8)
+WAIT_NAME, WAIT_DATE, WAIT_STOCK, WAIT_DELIVERY, WAIT_EXCEL, WAIT_RATES, WAIT_PAYMENTS = range(7)
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -982,7 +876,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/clear — очистити місяць\n"
             "/name — змінити ім'я\n"
             "/sheet — посилання на Google таблицю"
-            + ("\n/admin — всі менеджери\n/update — оновити довідник\n/rates — оновити курси валют\n/oplata — завантажити дати оплат\n/suma — вписати суму рахунку (старі рах.)\n/perekurs — перерахувати курси оплат" if update.effective_user.id in ADMIN_IDS else "")
+            + ("\n/admin — всі менеджери\n/update — оновити довідник\n/rates — оновити курси валют\n/oplata — завантажити дати оплат" if update.effective_user.id in ADMIN_IDS else "")
         )
     else:
         await update.message.reply_text("👋 Привіт! Як тебе звати? (введи ім'я)")
@@ -1060,9 +954,8 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Date / rate / manager logic ──────────────────────────────────────────
     # Date sources for THIS invoice:
     #   table_pay     — "Дата оплати клієнта" (AA) from orders table  ← PRIORITY
-    #   oplata_pay    — actual payment date loaded via /oplata (double-check)
+    #   oplata_pay    — actual payment date(s) loaded via /oplata (double-check)
     #   table_confirm — "Дата підтвердження замовлення" (V), fallback only
-    # Rule: rate date = EARLIEST of (table_pay, oplata_pay); else order-confirm date.
     table_pay = ""
     table_confirm = ""
     auto_manager = ""
@@ -1077,10 +970,20 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if not table_confirm: table_confirm = rec.get("confirm_date", "") or ""
                 if not auto_manager:  auto_manager = rec.get("manager", "") or ""
 
-    _ensure_payments_loaded()
-    oplata_pay = get_payment_date(inv_number)
+    # ── Payment tranches (for split cost). Source: /oplata. ───────────────────
+    pay_dates = get_payment_dates(inv_number)            # list, sorted asc
+    oplata_pay = pay_dates[0] if pay_dates else ""
     pay_eff = _earliest_date(table_pay, oplata_pay)
     auto_date = pay_eff or table_confirm
+
+    # Per-payment RAW interbank rates (no markup) — used by split formula in sheet
+    pay_rates = []
+    if len(pay_dates) >= 2:
+        for d in pay_dates[:3]:
+            rr = await get_nbu_rate(d, apply_markup=False)
+            pay_rates.append(rr if rr else 0)
+    ctx.user_data["pending_invoice"]["pay_dates"] = pay_dates
+    ctx.user_data["pending_invoice"]["pay_rates"] = pay_rates
 
     ctx.user_data["pending_invoice"]["auto_manager"] = auto_manager
     if auto_manager:
@@ -1114,6 +1017,17 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data["pending_invoice"]["rate"] = 0
             ctx.user_data["pending_invoice"]["date"] = auto_date
             lines.append(f"\n💱 Дата: *{auto_date}*{date_note} | ⚠️ Курс не знайдено — вкажи вручну в таблиці")
+
+        # Show payment-split breakdown when several tranches exist
+        if len(pay_dates) >= 2:
+            parts = " + ".join(
+                f"{d} ({pay_rates[i]:.2f})" if i < len(pay_rates) and pay_rates[i] else d
+                for i, d in enumerate(pay_dates[:3])
+            )
+            lines.append(
+                f"🧮 Оплат: *{len(pay_dates)}* — собівартість рахується частками "
+                f"(EUR/{len(pay_dates)} × курс кожної дати): {parts}"
+            )
 
         await msg.edit_text("\n".join(lines), parse_mode="Markdown")
         await msg.reply_text(
@@ -1257,74 +1171,37 @@ async def save_invoice(query, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("pending_invoice", None)
     ctx.user_data.pop("stock_selected", None)
 
+    # Per-payment equal-share cost (for the Telegram preview number only).
+    pay_rates = [r for r in inv.get("pay_rates", []) if r]
+    n_pay = len(pay_rates)
+    mk_factor = 1 + RATE_MARKUP / 100
     total_profit = 0
-    total_revenue = 0.0
-    total_cost = 0.0
-    base_rate_up = 0.0
     for item in inv.get("items", []):
         lu = lookup_article(item["article"])
         cost_eur = lu.get("cost_eur", 0)
         duty = lu.get("duty", 0.04)
-        rate = item.get("rate", 52.0)
-        if rate and not base_rate_up:
-            base_rate_up = rate
-        cost_uah = cost_eur * (1 + duty) * rate * item["qty"]
-        revenue = item["price_uah"] * item["qty"]
-        total_revenue += revenue
-        total_cost += cost_uah
-        profit = (item["price_uah"] - cost_eur * (1 + duty) * rate) * item["qty"] if item.get("is_stock") else revenue - cost_uah
-        total_profit += profit
-
-    # ── Перевірка оплат у момент завантаження рахунку ─────────────────────────
-    # Тут сума рахунку (виторг) відома напряму з PDF, тому її НЕ треба шукати в «ВСІ».
-    # Зберігаємо її як джерело правди й одразу дивимось: скільки оплат, на яку суму,
-    # чи закрито, і чи треба коригування 50/50.
-    inv_num = _inv_num(inv.get("invoice_num", ""))
-    pay_block = ""
-    if inv_num and total_revenue > 0:
-        INVOICE_TOTALS[inv_num] = round(total_revenue, 2)
-        _save_invoice_totals()
-        _ensure_payments_loaded()
-        tr = get_payments(inv_num)
-        if tr:
-            paid = total_paid(inv_num)
-            n = len(tr)
-            closed = paid >= total_revenue * 0.995
-            if closed:
-                wr = blended_rate(inv_num)
-                fr = first_payment_rate(inv_num)
-                base = base_rate_up or fr
-                if wr > 0 and base > 0 and abs(wr - base) > 1e-6 and total_cost > 0:
-                    korig = -round(total_cost * (wr / base - 1), 2)
-                    total_profit += korig
-                    pay_block = (
-                        f"\n\n💳 Оплат: {n}, разом {paid:,.0f} грн — *закрито*\n"
-                        f"Курс базовий: {base:.2f} → зважений: {wr:.2f}\n"
-                        f"⚖️ Перерахунок собівартості: *{korig:+,.0f} грн* (у прибутку)"
-                    ).replace(",", " ")
-                else:
-                    pay_block = (
-                        f"\n\n💳 Оплат: {n}, разом {paid:,.0f} грн — *закрито* "
-                        f"(один курс, перерахунок не потрібен)"
-                    ).replace(",", " ")
-            else:
-                pay_block = (
-                    f"\n\n💳 Оплат: {n}, разом {paid:,.0f} з {total_revenue:,.0f} грн — *часткова*\n"
-                    f"⚠️ У ЗП піде лише після повної оплати"
-                ).replace(",", " ")
+        if n_pay >= 2:
+            cost_unit = sum(cost_eur / n_pay * (1 + duty) * rr * mk_factor for rr in pay_rates)
         else:
-            pay_block = "\n\n💳 Оплат по цьому рахунку ще немає"
+            rate = item.get("rate", 52.0)
+            cost_unit = cost_eur * (1 + duty) * rate
+        cost_uah = cost_unit * item["qty"]
+        revenue = item["price_uah"] * item["qty"]
+        profit = (item["price_uah"] - cost_unit) * item["qty"] if item.get("is_stock") else revenue - cost_uah
+        total_profit += profit
 
     stock_count = len(selected)
     stock_msg = f"🔴 Складських: {stock_count}" if stock_count else "🟢 Складських немає"
+    split_msg = ""
+    if n_pay >= 2:
+        split_msg = f"\n🧮 Собівартість частками: {n_pay} оплати (рівні долі)"
 
     await query.edit_message_text(
         f"✅ *Рахунок збережено!*\n\n"
         f"💰 Прибуток: *{total_profit:,.0f} грн*\n"
-        f"{stock_msg}\n"
+        f"{stock_msg}{split_msg}\n"
         f"📁 Рахунків цього місяця: {len(user.get('invoices', []))}\n"
-        f"{sheet_msg}"
-        f"{pay_block}\n\n"
+        f"{sheet_msg}\n\n"
         f"Надішли наступний PDF або /report для Excel.",
         parse_mode="Markdown"
     )
@@ -1346,7 +1223,7 @@ def read_sheet_rows_for_manager(manager_name: str):
         all_vals = ws.get_all_values()
         if len(all_vals) < 2:
             return [], "empty"
-        # Columns: A..X (0..23). Data rows have article in col E (idx 4)
+        # Data rows have article in col E (idx 4)
         # Skip header (row 1), separator rows (empty), and invoice-title rows (no article)
         rows = []
         for r in all_vals[1:]:
@@ -1361,168 +1238,6 @@ def read_sheet_rows_for_manager(manager_name: str):
         logger.error(f"read_sheet error: {e}")
         return None, str(e)
 
-def _dt(s):
-    try:
-        return datetime.strptime(s, "%d.%m.%Y")
-    except:
-        return datetime.min
-
-def _num_cell(v):
-    try:
-        return float(str(v).replace("\xa0","").replace(" ","").replace(",","."))
-    except:
-        return 0.0
-
-def _group_rows_by_invoice(all_vals):
-    """Group a manager/ВСІ sheet's rows into invoices.
-    Returns list of {'inv': num, 'rows': [item rows]} (header/separator rows excluded)."""
-    groups = []
-    cur = None
-    for r in all_vals[1:]:
-        if len(r) < 5:
-            continue
-        cnum = r[2].strip() if len(r) > 2 else ""
-        art = r[4].strip() if len(r) > 4 else ""
-        if art:
-            if cur is None:
-                cur = {"inv": "", "rows": []}
-                groups.append(cur)
-            cur["rows"].append(r)
-        elif cnum:
-            m = re.search(r"[№#No]+\s*(\d+)", cnum)
-            cur = {"inv": m.group(1) if m else "", "rows": []}
-            groups.append(cur)
-        # fully-empty separator row → ignore
-    return [g for g in groups if g["rows"]]
-
-def read_invoices_for_manager(manager_name: str):
-    """Read manager's sheet grouped by invoice. Returns (groups, status)."""
-    try:
-        sh = get_gsheet()
-        if not sh:
-            return None, "no_connection"
-        try:
-            ws = sh.worksheet(manager_name)
-        except gspread.WorksheetNotFound:
-            return [], "no_sheet"
-        all_vals = ws.get_all_values()
-        if len(all_vals) < 2:
-            return [], "empty"
-        return _group_rows_by_invoice(all_vals), "ok"
-    except Exception as e:
-        logger.error(f"read_invoices error: {e}")
-        return None, str(e)
-
-def invoice_revenue_map_all() -> dict:
-    """Map invoice_num -> total revenue (виторг).
-
-    Primary source = totals captured from the PDF at upload time
-    (INVOICE_TOTALS). The 'ВСІ' sheet is only a best-effort fallback for
-    invoices processed before this was introduced.
-    """
-    out = {}
-    try:
-        sh = get_gsheet()
-        if sh:
-            try:
-                ws = sh.worksheet("ВСІ")
-                for g in _group_rows_by_invoice(ws.get_all_values()):
-                    if not g["inv"]:
-                        continue
-                    rev = sum(_num_cell(r[12]) for r in g["rows"] if len(r) > 12)
-                    out[g["inv"]] = round(out.get(g["inv"], 0) + rev, 2)
-            except gspread.WorksheetNotFound:
-                pass
-    except Exception as e:
-        logger.error(f"revenue map error: {e}")
-    # Totals captured from PDF win over anything read from the sheet.
-    for inv, tot in INVOICE_TOTALS.items():
-        try:
-            if tot and float(tot) > 0:
-                out[str(inv)] = round(float(tot), 2)
-        except:
-            pass
-    return out
-
-def _load_payments_from_sheet():
-    """Durable store = 'Оплати' tab. Load it into PAYMENTS (sheet wins)."""
-    global _payments_loaded_from_sheet
-    _payments_loaded_from_sheet = True
-    try:
-        sh = get_gsheet()
-        if not sh:
-            return
-        try:
-            ws = sh.worksheet("Оплати")
-        except gspread.WorksheetNotFound:
-            return
-        vals = ws.get_all_values()
-        loaded = {}
-        for r in vals[1:]:
-            if len(r) < 2:
-                continue
-            inv = re.sub(r"\D", "", str(r[0]))
-            date = str(r[1]).strip() if len(r) > 1 else ""
-            if not inv or not date:
-                continue
-            amount = _num_cell(r[2]) if len(r) > 2 else 0.0
-            rate = _num_cell(r[3]) if len(r) > 3 else 0.0
-            loaded.setdefault(inv, []).append(
-                {"date": date, "amount": round(amount, 2), "rate": round(rate, 4)})
-        if loaded:
-            for inv, lst in loaded.items():
-                PAYMENTS[inv] = lst
-            _save_payments()
-    except Exception as e:
-        logger.error(f"load payments from sheet error: {e}")
-
-def _ensure_payments_loaded():
-    if not _payments_loaded_from_sheet:
-        _load_payments_from_sheet()
-
-def _write_payments_sheet(revenue_map: dict) -> bool:
-    """Rebuild the 'Оплати' tab from PAYMENTS with accumulation + status."""
-    sh = get_gsheet()
-    if not sh:
-        return False
-    try:
-        try:
-            ws = sh.worksheet("Оплати")
-            ws.clear()
-        except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title="Оплати", rows=2000, cols=8)
-        header = ["Рахунок", "Дата оплати", "Сума оплати", "Курс",
-                  "Накопичено", "Сума рахунку", "Статус"]
-        rows = [header]
-        for inv in sorted(PAYMENTS.keys(), key=lambda x: (len(x), x)):
-            tr = sorted(PAYMENTS[inv], key=lambda x: _dt(x.get("date", "")))
-            total = revenue_map.get(inv, 0)
-            acc = 0.0
-            for t in tr:
-                acc += float(t.get("amount", 0) or 0)
-                if total > 0:
-                    status = "закрито" if acc >= total * 0.995 else "часткова"
-                elif acc > 0:
-                    status = "невідома сума рах."
-                else:
-                    status = ""
-                rows.append([inv, t.get("date", ""),
-                             round(float(t.get("amount", 0) or 0), 2),
-                             round(float(t.get("rate", 0) or 0), 4),
-                             round(acc, 2),
-                             round(total, 2) if total else "",
-                             status])
-        ws.update(f"A1:G{len(rows)}", rows, value_input_option="USER_ENTERED")
-        ws.format("A1:G1", {
-            "backgroundColor": {"red": 0.17, "green": 0.18, "blue": 0.24},
-            "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
-            "horizontalAlignment": "CENTER"
-        })
-        return True
-    except Exception as e:
-        logger.error(f"write payments sheet error: {e}")
-        return False
-
 async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().replace("/","")
     try:
@@ -1535,76 +1250,49 @@ async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = user.get("name", str(uid))
     month = datetime.now().strftime("%m.%Y")
 
-    _ensure_payments_loaded()
+    # Read straight from Google Sheets (survives restarts)
+    rows, status = read_sheet_rows_for_manager(name)
 
-    # Read manager's sheet grouped by invoice
-    groups, status = read_invoices_for_manager(name)
     if status == "no_connection":
         await update.message.reply_text("⚠️ Google Sheets недоступний. Спробуй пізніше.")
         return ConversationHandler.END
-    if status in ("no_sheet", "empty") or not groups:
+    if status in ("no_sheet", "empty") or not rows:
         await update.message.reply_text("📭 Немає рахунків цього місяця в таблиці.")
         return ConversationHandler.END
 
+    # Sum profit from columns N (Прибуток S, idx 13) + O (Надбавка T, idx 14)
+    # and revenue from M (Виторг, idx 12)
     def num(v):
-        return _num_cell(v)
+        try:
+            return float(str(v).replace("\xa0","").replace(" ","").replace(",","."))
+        except:
+            return 0.0
 
-    counted_rows = []      # item rows of invoices that count toward salary
     total_revenue = 0.0
     total_profit = 0.0
-    open_invoices = []     # [(inv, paid, total)]
-    closed_breakdown = []  # [(inv, revenue, wrate, profit)]
-
-    for g in groups:
-        inv = g["inv"]
-        rows = g["rows"]
-        revenue = sum(num(r[12]) for r in rows)                     # M Виторг
-        profit_old = sum(num(r[13]) + num(r[14]) for r in rows)     # N+O (база)
-
-        tranches = get_payments(inv) if inv else []
-        if not tranches:
-            # No payment data → behave as before
-            counted_rows.extend(rows)
-            total_revenue += revenue
-            total_profit += profit_old
-            continue
-
-        paid = round(sum(float(t.get("amount", 0) or 0) for t in tranches), 2)
-        amounts_known = any(float(t.get("amount", 0) or 0) > 0 for t in tranches)
-        is_closed = (not amounts_known) or (revenue <= 0) or (paid >= revenue * 0.995)
-
-        if not is_closed:
-            open_invoices.append((inv, paid, round(revenue, 2)))
-            continue
-
-        # Собівартість вже пораховано у самому листі за середнім курсом оплат
-        # (колонки «Курс опл.1/2/3» → Курс I → Собів J). Тому тут НЕ перераховуємо
-        # ще раз — беремо прибуток N+O як він є, інакше вийшло б подвійно.
-        counted_rows.extend(rows)
+    for r in rows:
+        revenue = num(r[12])          # M Виторг
+        s_val = num(r[13])            # N Прибуток (S)
+        t_val = num(r[14])            # O Надбавка (T)
         total_revenue += revenue
-        total_profit += profit_old
+        total_profit += (s_val + t_val)
 
     net = total_profit - delivery
     salary = max(0, net) * SALARY_PCT / 100
 
-    path = build_excel_from_rows(name, counted_rows, month, delivery, total_revenue,
-                                 total_profit, net, salary, closed_breakdown, open_invoices)
-
-    open_msg = ""
-    if open_invoices:
-        open_msg = f"\n⏳ Відкритих (не в ЗП): *{len(open_invoices)}*"
+    # Build simple Excel from sheet rows
+    path = build_excel_from_rows(name, rows, month, delivery, total_revenue, total_profit, net, salary)
 
     await update.message.reply_document(
         document=open(path,"rb"),
         filename=f"ЗП_{name}_{month}.xlsx",
         caption=(
             f"📊 *Звіт за {month}*\n\n"
-            f"Позицій (зараховано): {len(counted_rows)}\n"
+            f"Позицій: {len(rows)}\n"
             f"Виторг: *{total_revenue:,.0f} грн*\n"
-            f"Прибуток: *{total_profit:,.0f} грн*\n"
+            f"Прибуток (S+T): *{total_profit:,.0f} грн*\n"
             f"Доставка: *{delivery:,.0f} грн*\n"
-            f"Чистий: *{net:,.0f} грн*"
-            f"{open_msg}\n"
+            f"Чистий: *{net:,.0f} грн*\n"
             f"━━━━━━━━━━━━\n"
             f"💰 *ЗП ({SALARY_PCT}%): {salary:,.0f} грн*"
         ),
@@ -1612,8 +1300,7 @@ async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-def build_excel_from_rows(manager_name, rows, month, delivery, total_revenue, total_profit, net, salary,
-                          closed_breakdown=None, open_invoices=None):
+def build_excel_from_rows(manager_name, rows, month, delivery, total_revenue, total_profit, net, salary):
     """Build Excel report from Google Sheet rows."""
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -1648,7 +1335,11 @@ def build_excel_from_rows(manager_name, rows, month, delivery, total_revenue, to
     for r in rows:
         is_stock = (len(r) > 15 and r[15] == "так")
         supplier = r[24] if len(r) > 24 else ""
-        vals = [r[1], r[2], r[3], r[4], num(r[5]), num(r[6]), num(r[8]),
+        # Курс: single (col I) or, for split invoices, the first tranche rate (col Z)
+        kurs = num(r[8])
+        if kurs == 0 and len(r) > 25:
+            kurs = num(r[25])
+        vals = [r[1], r[2], r[3], r[4], num(r[5]), num(r[6]), kurs,
                 num(r[11]), num(r[12]), num(r[13]), num(r[14]),
                 "так" if is_stock else "", supplier]
         for c,v in enumerate(vals,1):
@@ -1687,44 +1378,6 @@ def build_excel_from_rows(manager_name, rows, month, delivery, total_revenue, to
         if i==3:
             cv.fill=PatternFill('solid',fgColor='D5F5E3')
             cv.font=Font(name='Arial',size=14,color='1E8449',bold=True)
-
-    nxt = SR + len(labels) + 1
-
-    # Closed invoices: cost recalculated at the weighted payment rate
-    cb = [b for b in (closed_breakdown or []) if b[4]]  # only those with a non-zero correction
-    if cb:
-        ws.merge_cells(f'A{nxt}:F{nxt}')
-        ws.cell(nxt,1,'ПЕРЕРАХУНОК СОБІВАРТОСТІ (курс оплат)').font=Font(name='Arial',bold=True,size=10,color='FFFFFF')
-        ws.cell(nxt,1).fill=PatternFill('solid',fgColor='1A5276')
-        for c,h in enumerate(['Рахунок','Виторг','Курс базовий','Курс зваж.','Δ собівартості','Прибуток'],1):
-            cell=ws.cell(nxt+1,c,h)
-            cell.font=Font(name='Arial',bold=True,size=9,color='FFFFFF')
-            cell.fill=PatternFill('solid',fgColor='2C3E50'); cell.border=brd
-        rr=nxt+2
-        for inv,rev,fr,wr,kor,pr in cb:
-            for c,v in enumerate([f'рах.{inv}', round(rev,2), round(fr,4), round(wr,4), round(kor,2), round(pr,2)],1):
-                cell=ws.cell(rr,c,v); cell.font=Font(name='Arial',size=9); cell.border=brd
-                if c in [2,3,4,5,6]: cell.number_format='#,##0.00'
-            rr+=1
-        nxt = rr + 1
-
-    # Open (partially paid) invoices — NOT in salary
-    oi = open_invoices or []
-    if oi:
-        ws.merge_cells(f'A{nxt}:E{nxt}')
-        ws.cell(nxt,1,'ВІДКРИТІ РАХУНКИ (не повністю оплачені — НЕ в ЗП)').font=Font(name='Arial',bold=True,size=10,color='FFFFFF')
-        ws.cell(nxt,1).fill=PatternFill('solid',fgColor='922B21')
-        for c,h in enumerate(['Рахунок','Оплачено','Сума рахунку','Залишок'],1):
-            cell=ws.cell(nxt+1,c,h)
-            cell.font=Font(name='Arial',bold=True,size=9,color='FFFFFF')
-            cell.fill=PatternFill('solid',fgColor='C0392B'); cell.border=brd
-        rr=nxt+2
-        for inv,paid,tot in oi:
-            for c,v in enumerate([f'рах.{inv}', round(paid,2), round(tot,2), round(tot-paid,2)],1):
-                cell=ws.cell(rr,c,v); cell.font=Font(name='Arial',size=9); cell.border=brd
-                if c in [2,3,4]: cell.number_format='#,##0.00'
-                cell.fill=PatternFill('solid',fgColor='FDEDEC')
-            rr+=1
 
     path = str(DATA_DIR/f"salary_{manager_name}_{month}.xlsx")
     wb.save(path)
@@ -1837,20 +1490,12 @@ async def handle_rates_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
         rates_new = {}
-        skipped_junk = 0
         for _, row in df.iterrows():
             try:
                 d = row[date_col]
                 if pd.isna(d): continue
-                # skip junk/placeholder dates (e.g. 01.01.1900 from a malformed cell)
-                if hasattr(d, "year") and d.year < 2000:
-                    skipped_junk += 1
-                    continue
                 date_str = d.strftime("%d.%m.%Y") if hasattr(d, "strftime") else str(d)[:10]
-                if date_str.endswith("1900"):
-                    skipped_junk += 1
-                    continue
-                buy = float(re.sub(r"[^\d.,\-]", "", str(row[buy_col])).replace(",", "."))
+                buy = float(str(row[buy_col]).replace(",", "."))
                 if buy > 0:
                     rates_new[date_str] = buy
             except: pass
@@ -1864,7 +1509,6 @@ async def handle_rates_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(
             f"✅ *Курси оновлено!*\n\n"
             f"📅 Дат: *{len(rates_new)}*\n"
-            f"🗑 Пропущено сміття: {skipped_junk}\n"
             f"📆 Від {min(rates_new.keys())} до {max(rates_new.keys())}",
             parse_mode="Markdown"
         )
@@ -1874,7 +1518,7 @@ async def handle_rates_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Process uploaded Excel and rebuild all 3 lookup files"""
+    """Process uploaded Excel and rebuild all lookup files"""
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Немає доступу.")
         return ConversationHandler.END
@@ -2134,57 +1778,42 @@ async def cmd_oplata(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`Оплати за 29/05/26 «...»`\n"
         "`1. КЛІЄНТ рах.834 – 64 531,20`\n"
         "`2. КЛІЄНТ рах.835 – 33 799,20`\n\n"
-        "Сума важлива: бот рахує часткові оплати. Рахунок «закрито», коли оплачено ≥ суми рахунку; "
-        "курс для собівартості — зважений за датами/сумами оплат.",
+        "Можна одразу кілька днів підряд. Дата з заголовка прив'язується до всіх рах. під ним.\n"
+        "Якщо один рахунок оплачено двома датами — додай його під обома заголовками, "
+        "бот збереже обидві дати й порахує собівартість частками.",
         parse_mode="Markdown"
     )
     return WAIT_PAYMENTS
 
-async def _finish_payments(update, tranches: list):
-    if not tranches:
+async def _finish_payments(update, new_dates: dict):
+    if not new_dates:
         await update.message.reply_text(
             "❌ Не знайшов жодного рядка. Перевір формат: заголовок «Оплати за ДД/ММ/РР» "
-            "і рядки з `рах.НОМЕР – СУМА`.",
+            "і рядки з `рах.НОМЕР`.",
             parse_mode="Markdown"
         )
         return
-    _ensure_payments_loaded()
-    # Compute rate per tranche date (archive → Minfin → NBU)
-    rate_cache = {}
-    for t in tranches:
-        d = t["date"]
-        if d not in rate_cache:
-            rate_cache[d] = await get_payment_rate(d) or 0.0
-        t["rate"] = rate_cache[d]
-
-    added = _merge_payment_tranches(tranches)
-
-    # Persist to the durable 'Оплати' tab (with accumulation + status vs invoice total)
-    revenue_map = invoice_revenue_map_all()
-    sheet_ok = _write_payments_sheet(revenue_map)
-
-    invs = sorted({t["inv"] for t in tranches}, key=lambda x: (len(x), x))
-    lines = [f"✅ *Оплати збережено:* +{added} трансакцій по {len(invs)} рах."]
-    for inv in invs[:8]:
-        paid = total_paid(inv)
-        tot = revenue_map.get(inv, 0)
-        if tot > 0:
-            st = "закрито" if paid >= tot * 0.995 else "часткова"
-            lines.append(f"• рах.{inv}: оплачено {paid:,.0f} з {tot:,.0f} — {st}".replace(",", " "))
+    _merge_payment_dates(new_dates)
+    sample = list(new_dates.items())[:8]
+    lines = [f"✅ *Оплати збережено:* {len(new_dates)} рах."]
+    for inv, dates in sample:
+        dl = _as_date_list(dates)
+        if len(dl) >= 2:
+            lines.append(f"• рах.{inv} → {' + '.join(dl)} _(частками)_")
         else:
-            lines.append(f"• рах.{inv}: оплачено {paid:,.0f} (сума рах. ще невідома)".replace(",", " "))
-    if len(invs) > 8:
-        lines.append(f"…та ще {len(invs) - 8} рах.")
-    lines.append("\n📊 Вкладка *Оплати* оновлена ✓" if sheet_ok else "\n⚠️ Google Sheets недоступний (збережено локально)")
-    lines.append("Курс для закритих рахунків — зважений за сумами оплат. Частково оплачені в ЗП не йдуть.")
+            lines.append(f"• рах.{inv} → {dl[0] if dl else '—'}")
+    if len(new_dates) > len(sample):
+        lines.append(f"…та ще {len(new_dates) - len(sample)}")
+    lines.append(f"\n📦 Всього в базі оплат: {len(PAYMENT_DATES)}")
+    lines.append("\nДля рахунків з ≥2 датами собівартість рахується частками (рівні долі × курс кожної дати).")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def handle_payments_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return ConversationHandler.END
     text = update.message.text or ""
-    tranches = _parse_payment_text(text)
-    await _finish_payments(update, tranches)
+    new_dates = _parse_payment_text(text)
+    await _finish_payments(update, new_dates)
     return ConversationHandler.END
 
 async def handle_payments_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2212,110 +1841,13 @@ async def handle_payments_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         text_lines.append(ln)
         os.remove(xlsx_path)
 
-        tranches = _parse_payment_text("\n".join(text_lines))
+        new_dates = _parse_payment_text("\n".join(text_lines))
         await msg.delete()
-        await _finish_payments(update, tranches)
+        await _finish_payments(update, new_dates)
     except Exception as e:
         logger.error(f"oplata excel error: {e}")
         await msg.edit_text(f"❌ Помилка: {e}")
     return ConversationHandler.END
-
-
-# ── Manual invoice totals (Сума рахунку) for old invoices ────────────────────
-async def cmd_suma(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin: set invoice totals (виторг) by hand for invoices not in the bot."""
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Немає доступу.")
-        return ConversationHandler.END
-    await update.message.reply_text(
-        "🧾 Введи суми рахунків (виторг), по рядку на рахунок:\n"
-        "`65 = 146268`\n`66 = 29886`\n\n"
-        "Можна й через пробіл: `65 146268`.\n"
-        "Це потрібно для старих рахунків, яких немає в боті — щоб він зрозумів, "
-        "коли рахунок «закрито» і чи треба коригування 50/50.",
-        parse_mode="Markdown"
-    )
-    return WAIT_SUMA
-
-def _parse_amount(s: str) -> float:
-    s = str(s).replace(" ", "").replace("\xa0", "")
-    if s.count(",") and s.count("."):
-        s = s.replace(".", "").replace(",", ".")
-    else:
-        s = s.replace(",", ".")
-    try:
-        return float(s)
-    except:
-        return 0.0
-
-async def handle_suma_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return ConversationHandler.END
-    text = update.message.text or ""
-    added = {}
-    for line in text.splitlines():
-        # "рах.65 = 146268", "65: 146268", "65 - 146268" or "65 146268"
-        m = re.match(r"\s*(?:рах\.?\s*№?\s*)?(\d+)\s*[=:\-]\s*([\d\s.,]+)", line, re.IGNORECASE) \
-            or re.match(r"\s*(?:рах\.?\s*№?\s*)?(\d+)\s+([\d][\d\s.,]{2,})", line, re.IGNORECASE)
-        if not m:
-            continue
-        inv = m.group(1)
-        val = _parse_amount(m.group(2))
-        if val > 0:
-            INVOICE_TOTALS[str(inv)] = round(val, 2)
-            added[inv] = round(val, 2)
-    if not added:
-        await update.message.reply_text(
-            "❌ Не розпізнав жодного рядка. Формат: `65 = 146268`",
-            parse_mode="Markdown"
-        )
-        return WAIT_SUMA
-    _save_invoice_totals()
-    _ensure_payments_loaded()
-    sheet_ok = _write_payments_sheet(invoice_revenue_map_all())
-    lines = [f"✅ *Збережено сум рахунків: {len(added)}*"]
-    for inv, v in list(added.items())[:10]:
-        paid = total_paid(inv)
-        if paid > 0:
-            st = "закрито" if paid >= v * 0.995 else "часткова"
-            lines.append(f"• рах.{inv}: сума {v:,.0f}, оплачено {paid:,.0f} → {st}".replace(",", " "))
-        else:
-            lines.append(f"• рах.{inv}: сума {v:,.0f} (оплат ще немає)".replace(",", " "))
-    if len(added) > 10:
-        lines.append(f"…та ще {len(added) - 10}")
-    lines.append("\n📊 Вкладка *Оплати* оновлена ✓" if sheet_ok else "\n⚠️ Google Sheets недоступний (збережено локально)")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    return ConversationHandler.END
-
-# ── Recompute all stored payment rates from the archive/NBU ──────────────────
-async def cmd_perekurs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin: re-resolve the курс of every stored tranche (unfreezes old 52,72)."""
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Немає доступу.")
-        return
-    _ensure_payments_loaded()
-    msg = await update.message.reply_text("⏳ Перераховую курси по всіх збережених оплатах...")
-    rate_cache = {}
-    changed = 0
-    for inv, lst in PAYMENTS.items():
-        for t in lst:
-            d = t.get("date", "")
-            if not d:
-                continue
-            if d not in rate_cache:
-                rate_cache[d] = await get_payment_rate(d) or 0.0
-            nr = round(float(rate_cache[d]), 4)
-            if nr > 0 and round(float(t.get("rate", 0) or 0), 4) != nr:
-                t["rate"] = nr
-                changed += 1
-    _save_payments()
-    sheet_ok = _write_payments_sheet(invoice_revenue_map_all())
-    await msg.edit_text(
-        f"✅ *Курси перераховано.*\n"
-        f"🔁 Оновлено траншів: *{changed}*\n"
-        + ("📊 Вкладка *Оплати* оновлена ✓" if sheet_ok else "⚠️ Google Sheets недоступний"),
-        parse_mode="Markdown"
-    )
 
 
 async def cmd_sheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2336,7 +1868,6 @@ def main():
             CommandHandler("update", cmd_update),
             CommandHandler("rates", cmd_rates),
             CommandHandler("oplata", cmd_oplata),
-            CommandHandler("suma", cmd_suma),
         ],
         states={
             WAIT_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, set_name)],
@@ -2359,7 +1890,6 @@ def main():
                 ), handle_payments_excel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_payments_text),
             ],
-            WAIT_SUMA: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_suma_text)],
         },
         fallbacks=[CommandHandler("start", start)],
         allow_reentry=True,
@@ -2368,7 +1898,6 @@ def main():
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("sheet", cmd_sheet))
-    app.add_handler(CommandHandler("perekurs", cmd_perekurs))
     app.add_handler(CallbackQueryHandler(callback_clear, pattern="^clear_"))
     logger.info("Bot started")
     app.run_polling(drop_pending_updates=True)
