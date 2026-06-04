@@ -489,14 +489,22 @@ def append_to_sheets(manager_name: str, inv: dict):
                 fo = "=0"
 
             base_rate_cell = round(rate, 2) if rate else ""
-            # Курс = середнє курсів оплат (рівні частки, як руками /2);
-            # якщо оплат ще немає — базовий курс заливки.
-            fallback = base_rate_cell if base_rate_cell != "" else 0
-            i_formula = f'=IFERROR(AVERAGE(Z{r}:AB{r}),{fallback})'
+            n_pay = len(pay_rates)
             # payment-rate cells Z/AA/AB (up to 3)
-            z = pay_rates[0] if len(pay_rates) > 0 else ""
-            aa = pay_rates[1] if len(pay_rates) > 1 else ""
-            ab = pay_rates[2] if len(pay_rates) > 2 else ""
+            z = pay_rates[0] if n_pay > 0 else ""
+            aa = pay_rates[1] if n_pay > 1 else ""
+            ab = pay_rates[2] if n_pay > 2 else ""
+            # Курс = середнє курсів оплат (рівні частки, як руками /2, /3).
+            # ВАЖЛИВО: тільки чиста арифметика, БЕЗ коми-аргументів (AVERAGE/IFERROR),
+            # бо укр. локаль Google Sheets має роздільник ';' і ламає такі формули у #ERROR!.
+            if n_pay >= 3:
+                i_cell = f"=(Z{r}+AA{r}+AB{r})/3"
+            elif n_pay == 2:
+                i_cell = f"=(Z{r}+AA{r})/2"
+            elif n_pay == 1:
+                i_cell = f"=Z{r}"
+            else:
+                i_cell = base_rate_cell   # немає оплат → базовий курс числом
 
             row = [
                 "",                                              # A Менеджер
@@ -507,7 +515,7 @@ def append_to_sheets(manager_name: str, inv: dict):
                 item["qty"],                                     # F Кть
                 round(cost_eur, 2),                              # G Закуп EUR
                 duty_pct,                                        # H Мито%
-                i_formula,                                       # I Курс (СРЗНАЧ оплат)
+                i_cell,                                          # I Курс (СРЗНАЧ оплат)
                 f"=G{r}*(1+H{r}/100)*I{r}",                      # J Собів UAH/шт
                 f"=J{r}*F{r}",                                   # K Собів загал
                 item["price_uah"],                               # L Ціна прод
