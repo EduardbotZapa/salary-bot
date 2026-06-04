@@ -140,6 +140,16 @@ def weighted_rate(inv_num: str) -> float:
     den = sum(float(t["amount"]) for t in tr)
     return round(num / den, 4) if den else 0.0
 
+def blended_rate(inv_num: str) -> float:
+    """EQUAL-share blend of tranche rates — matches the manual formula
+    (EUR/2 × курс1) + (EUR/2 × курс2): each payment date weighs the same,
+    regardless of its amount. For N tranches it's the simple average."""
+    rates = [round(float(t.get("rate", 0) or 0), 4)
+             for t in get_payments(inv_num) if float(t.get("rate", 0) or 0) > 0]
+    if not rates:
+        return 0.0
+    return round(sum(rates) / len(rates), 4)
+
 def first_payment_rate(inv_num: str) -> float:
     """Rate of the earliest-dated tranche (the base rate the invoice was priced at)."""
     tr = [t for t in get_payments(inv_num) if t.get("date")]
@@ -1222,14 +1232,19 @@ async def save_invoice(query, ctx: ContextTypes.DEFAULT_TYPE):
 
     total_profit = 0
     total_revenue = 0.0
+    total_cost = 0.0
+    base_rate_up = 0.0
     for item in inv.get("items", []):
         lu = lookup_article(item["article"])
         cost_eur = lu.get("cost_eur", 0)
         duty = lu.get("duty", 0.04)
         rate = item.get("rate", 52.0)
+        if rate and not base_rate_up:
+            base_rate_up = rate
         cost_uah = cost_eur * (1 + duty) * rate * item["qty"]
         revenue = item["price_uah"] * item["qty"]
         total_revenue += revenue
+        total_cost += cost_uah
         profit = (item["price_uah"] - cost_eur * (1 + duty) * rate) * item["qty"] if item.get("is_stock") else revenue - cost_uah
         total_profit += profit
 
@@ -1249,20 +1264,21 @@ async def save_invoice(query, ctx: ContextTypes.DEFAULT_TYPE):
             n = len(tr)
             closed = paid >= total_revenue * 0.995
             if closed:
-                wr = weighted_rate(inv_num)
+                wr = blended_rate(inv_num)
                 fr = first_payment_rate(inv_num)
-                if wr > 0 and fr > 0 and abs(wr - fr) > 1e-6:
-                    korig = round(total_revenue * (wr / fr - 1), 2)
+                base = base_rate_up or fr
+                if wr > 0 and base > 0 and abs(wr - base) > 1e-6 and total_cost > 0:
+                    korig = -round(total_cost * (wr / base - 1), 2)
                     total_profit += korig
                     pay_block = (
                         f"\n\n💳 Оплат: {n}, разом {paid:,.0f} грн — *закрито*\n"
-                        f"Курс 1-ї опл.: {fr:.2f} → зважений: {wr:.2f}\n"
-                        f"⚖️ Коригування 50/50: *{korig:+,.0f} грн* (у прибутку)"
+                        f"Курс базовий: {base:.2f} → зважений: {wr:.2f}\n"
+                        f"⚖️ Перерахунок собівартості: *{korig:+,.0f} грн* (у прибутку)"
                     ).replace(",", " ")
                 else:
                     pay_block = (
                         f"\n\n💳 Оплат: {n}, разом {paid:,.0f} грн — *закрито* "
-                        f"(один курс, коригування не потрібне)"
+                        f"(один курс, перерахунок не потрібен)"
                     ).replace(",", " ")
             else:
                 pay_block = (
@@ -1534,19 +1550,31 @@ async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             open_invoices.append((inv, paid, round(revenue, 2)))
             continue
 
-        # Currency-difference коригування: база за курсом 1-ї оплати,
-        # пізніше оплачена частка дорожчає за своїм курсом.
+        # ── Перерахунок СОБІВАРТОСТІ за зваженим курсом оплат ──────────────
+        # EUR викуповується частинами на дати оплат клієнта, тому собівартість
+        # рахується як у тебе руками:  (EUR/2 × курс1) + (EUR/2 × курс2)...
+        # Тобто база × (зважений_курс / курс_у_таблиці). Виторг НЕ чіпаємо.
+        # Курс росте → собівартість росте → прибуток падає (знак мінус).
+        cost_old = sum(num(r[10]) for r in rows)                    # K Собів загал
+        base_rate = 0.0
+        for r in rows:
+            sr = num(r[8])                                          # I Курс (як записано)
+            if sr > 0:
+                base_rate = sr
+                break
         first_rate = first_payment_rate(inv)
-        wr = weighted_rate(inv)
+        wr = blended_rate(inv)
+        if not base_rate:
+            base_rate = first_rate
         korig = 0.0
-        if first_rate > 0 and wr > 0:
-            korig = round(revenue * (wr / first_rate - 1), 2)
+        if base_rate > 0 and wr > 0 and cost_old > 0:
+            korig = -round(cost_old * (wr / base_rate - 1), 2)      # додаткова собівартість (мінус до прибутку)
         profit = round(profit_old + korig, 2)
 
         counted_rows.extend(rows)
-        total_revenue += round(revenue + korig, 2)
+        total_revenue += revenue                                   # виторг лишається як є
         total_profit += profit
-        closed_breakdown.append((inv, round(revenue, 2), first_rate, wr, korig, profit))
+        closed_breakdown.append((inv, round(revenue, 2), base_rate, wr, korig, profit))
 
     net = total_profit - delivery
     salary = max(0, net) * SALARY_PCT / 100
@@ -1654,13 +1682,13 @@ def build_excel_from_rows(manager_name, rows, month, delivery, total_revenue, to
 
     nxt = SR + len(labels) + 1
 
-    # Closed invoices with currency-difference коригування (paid across >1 rate)
-    cb = [b for b in (closed_breakdown or []) if b[4]]  # only those with a non-zero коригування
+    # Closed invoices: cost recalculated at the weighted payment rate
+    cb = [b for b in (closed_breakdown or []) if b[4]]  # only those with a non-zero correction
     if cb:
         ws.merge_cells(f'A{nxt}:F{nxt}')
-        ws.cell(nxt,1,'КОРИГУВАННЯ (курсова різниця за оплатами)').font=Font(name='Arial',bold=True,size=10,color='FFFFFF')
+        ws.cell(nxt,1,'ПЕРЕРАХУНОК СОБІВАРТОСТІ (курс оплат)').font=Font(name='Arial',bold=True,size=10,color='FFFFFF')
         ws.cell(nxt,1).fill=PatternFill('solid',fgColor='1A5276')
-        for c,h in enumerate(['Рахунок','Виторг','Курс 1-ї опл.','Курс зваж.','Коригування','Прибуток'],1):
+        for c,h in enumerate(['Рахунок','Виторг','Курс базовий','Курс зваж.','Δ собівартості','Прибуток'],1):
             cell=ws.cell(nxt+1,c,h)
             cell.font=Font(name='Arial',bold=True,size=9,color='FFFFFF')
             cell.fill=PatternFill('solid',fgColor='2C3E50'); cell.border=brd
