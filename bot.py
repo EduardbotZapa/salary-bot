@@ -403,9 +403,10 @@ def get_or_create_ws(spreadsheet, name: str):
                "Ціна прод UAH","Виторг",
                "Прибуток (S)","Надбавка (T)","Склад?",
                "УКТЗЕД","Бренд","Джерело",
-               "Прайс EUR","Вага/шт","Вага Китай","Вага Європа","Додано","Постачальник"]
+               "Прайс EUR","Вага/шт","Вага Китай","Вага Європа","Додано","Постачальник",
+               "Курс опл.1","Курс опл.2","Курс опл.3"]
     ws.append_row(headers)
-    ws.format("A1:Y1", {
+    ws.format("A1:AB1", {
         "backgroundColor": {"red":0.17,"green":0.18,"blue":0.24},
         "textFormat": {"bold":True,"foregroundColor":{"red":1,"green":1,"blue":1}},
         "horizontalAlignment": "CENTER"
@@ -418,6 +419,7 @@ def append_to_sheets(manager_name: str, inv: dict):
         sh = get_gsheet()
         if not sh:
             return False
+        _ensure_payments_loaded()
         ws_mgr = get_or_create_ws(sh, manager_name)
         ws_all = get_or_create_ws(sh, "ВСІ")
 
@@ -430,6 +432,10 @@ def append_to_sheets(manager_name: str, inv: dict):
         m_sh = re_sh.search(r"[№#No]+\s*(\d+)", invoice_num)
         inv_number = m_sh.group(1) if m_sh else ""
 
+        # Payment-date rates for this invoice (equal-split blend = manual /2 logic)
+        pay_rates = [round(float(t.get("rate", 0) or 0), 2)
+                     for t in get_payments(inv_number) if float(t.get("rate", 0) or 0) > 0][:3]
+
         # Get current row count
         existing = ws_mgr.get_all_values()
         start_row = len(existing) + 1
@@ -441,19 +447,19 @@ def append_to_sheets(manager_name: str, inv: dict):
 
         # Separator row (if not first entry)
         if start_row > 2:
-            rows_to_write.append([""] * 25)
+            rows_to_write.append([""] * 28)
             format_requests.append({
-                "range": f"A{start_row}:Y{start_row}",
+                "range": f"A{start_row}:AB{start_row}",
                 "format": {"backgroundColor": {"red": 0.85, "green": 0.91, "blue": 0.97}}
             })
-            all_sheet_rows.append([""] * 25)
+            all_sheet_rows.append([""] * 28)
             start_row += 1
 
         # Invoice header row
-        header = [manager_name, client, invoice_num, date] + [""] * 21
+        header = [manager_name, client, invoice_num, date] + [""] * 24
         rows_to_write.append(header)
         format_requests.append({
-            "range": f"A{start_row}:Y{start_row}",
+            "range": f"A{start_row}:AB{start_row}",
             "format": {
                 "backgroundColor": {"red": 0.78, "green": 0.87, "blue": 0.95},
                 "textFormat": {"bold": True}
@@ -482,6 +488,16 @@ def append_to_sheets(manager_name: str, inv: dict):
                 fn = f"=M{r}-K{r}"
                 fo = "=0"
 
+            base_rate_cell = round(rate, 2) if rate else ""
+            # Курс = середнє курсів оплат (рівні частки, як руками /2);
+            # якщо оплат ще немає — базовий курс заливки.
+            fallback = base_rate_cell if base_rate_cell != "" else 0
+            i_formula = f'=IFERROR(AVERAGE(Z{r}:AB{r}),{fallback})'
+            # payment-rate cells Z/AA/AB (up to 3)
+            z = pay_rates[0] if len(pay_rates) > 0 else ""
+            aa = pay_rates[1] if len(pay_rates) > 1 else ""
+            ab = pay_rates[2] if len(pay_rates) > 2 else ""
+
             row = [
                 "",                                              # A Менеджер
                 "",                                              # B Клієнт
@@ -491,7 +507,7 @@ def append_to_sheets(manager_name: str, inv: dict):
                 item["qty"],                                     # F Кть
                 round(cost_eur, 2),                              # G Закуп EUR
                 duty_pct,                                        # H Мито%
-                round(rate, 2) if rate else "",                  # I Курс
+                i_formula,                                       # I Курс (СРЗНАЧ оплат)
                 f"=G{r}*(1+H{r}/100)*I{r}",                      # J Собів UAH/шт
                 f"=J{r}*F{r}",                                   # K Собів загал
                 item["price_uah"],                               # L Ціна прод
@@ -508,6 +524,9 @@ def append_to_sheets(manager_name: str, inv: dict):
                 round(weight_unit * item["qty"], 3) if (is_stock and "trade" in source.lower()) else 0,  # W Вага Європа
                 datetime.now().strftime("%d.%m.%Y %H:%M"),       # X Додано
                 lu.get("supplier", ""),                          # Y Постачальник
+                z,                                               # Z Курс опл.1
+                aa,                                              # AA Курс опл.2
+                ab,                                              # AB Курс опл.3
             ]
             rows_to_write.append(row)
             all_sheet_rows.append(row)
@@ -521,7 +540,7 @@ def append_to_sheets(manager_name: str, inv: dict):
         first_row = len(existing) + 1
         last_row = first_row + len(rows_to_write) - 1
         ws_mgr.update(
-            f"A{first_row}:Y{last_row}",
+            f"A{first_row}:AB{last_row}",
             rows_to_write,
             value_input_option="USER_ENTERED"
         )
@@ -533,7 +552,7 @@ def append_to_sheets(manager_name: str, inv: dict):
         num_format = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}
         data_start = first_row + (2 if existing and len(existing) > 1 else 1)
         if data_start <= last_row:
-            for col in ["G", "H", "I", "J", "K", "L", "M", "N", "O", "T", "U", "V", "W"]:
+            for col in ["G", "H", "I", "J", "K", "L", "M", "N", "O", "T", "U", "V", "W", "Z", "AA", "AB"]:
                 batch_formats.append({"range": f"{col}{data_start}:{col}{last_row}", "format": num_format})
 
         # Stock article cells - red
@@ -1550,31 +1569,12 @@ async def handle_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             open_invoices.append((inv, paid, round(revenue, 2)))
             continue
 
-        # ── Перерахунок СОБІВАРТОСТІ за зваженим курсом оплат ──────────────
-        # EUR викуповується частинами на дати оплат клієнта, тому собівартість
-        # рахується як у тебе руками:  (EUR/2 × курс1) + (EUR/2 × курс2)...
-        # Тобто база × (зважений_курс / курс_у_таблиці). Виторг НЕ чіпаємо.
-        # Курс росте → собівартість росте → прибуток падає (знак мінус).
-        cost_old = sum(num(r[10]) for r in rows)                    # K Собів загал
-        base_rate = 0.0
-        for r in rows:
-            sr = num(r[8])                                          # I Курс (як записано)
-            if sr > 0:
-                base_rate = sr
-                break
-        first_rate = first_payment_rate(inv)
-        wr = blended_rate(inv)
-        if not base_rate:
-            base_rate = first_rate
-        korig = 0.0
-        if base_rate > 0 and wr > 0 and cost_old > 0:
-            korig = -round(cost_old * (wr / base_rate - 1), 2)      # додаткова собівартість (мінус до прибутку)
-        profit = round(profit_old + korig, 2)
-
+        # Собівартість вже пораховано у самому листі за середнім курсом оплат
+        # (колонки «Курс опл.1/2/3» → Курс I → Собів J). Тому тут НЕ перераховуємо
+        # ще раз — беремо прибуток N+O як він є, інакше вийшло б подвійно.
         counted_rows.extend(rows)
-        total_revenue += revenue                                   # виторг лишається як є
-        total_profit += profit
-        closed_breakdown.append((inv, round(revenue, 2), base_rate, wr, korig, profit))
+        total_revenue += revenue
+        total_profit += profit_old
 
     net = total_profit - delivery
     salary = max(0, net) * SALARY_PCT / 100
