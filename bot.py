@@ -973,8 +973,11 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Payment tranches (for split cost). Source: /oplata. ───────────────────
     pay_dates = get_payment_dates(inv_number)            # list, sorted asc
     oplata_pay = pay_dates[0] if pay_dates else ""
-    pay_eff = _earliest_date(table_pay, oplata_pay)
-    auto_date = pay_eff or table_confirm
+    # DATE PRIORITY: /oplata is authoritative. Then "Дата оплати клієнта" from the
+    # orders table. The order-confirmation date is NOT used for the rate anymore
+    # (it produced wrong dates, e.g. 06.02 instead of the payment date).
+    # If no payment date anywhere -> ask the manager (auto_date stays empty).
+    auto_date = oplata_pay or table_pay
 
     # Per-payment RAW interbank rates (no markup) — used by split formula in sheet
     pay_rates = []
@@ -990,14 +993,13 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"👤 Менеджер (з таблиці): *{auto_manager}*")
 
     # Note explaining which date was chosen
-    if table_pay and oplata_pay and table_pay != oplata_pay:
-        date_note = f" _(найраніша з: таблиця {table_pay} / оплата {oplata_pay})_"
-    elif oplata_pay and not table_pay:
-        date_note = " _(дата оплати з /oplata)_"
+    if oplata_pay:
+        if len(pay_dates) >= 2:
+            date_note = f" _(дати оплат з /oplata: {' + '.join(pay_dates[:3])})_"
+        else:
+            date_note = " _(дата оплати з /oplata)_"
     elif table_pay:
         date_note = " _(дата оплати з таблиці)_"
-    elif table_confirm:
-        date_note = " _(дата підтвердження замовлення)_"
     else:
         date_note = ""
 
@@ -1037,10 +1039,10 @@ async def handle_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return WAIT_STOCK
     else:
-        # No invoice-specific records found - all stock, ask manager for date
+        # No payment date found (not in /oplata, no "Дата оплати клієнта") — ask manager.
         ctx.user_data["pending_invoice"]["rate"] = 0
         ctx.user_data["pending_invoice"]["date"] = ""
-        lines.append(f"\n📅 Всі товари зі складу — введи дату оплати клієнтом (ДД.ММ.РРРР):")
+        lines.append(f"\n📅 Дату оплати не знайдено (немає в /oplata і в таблиці).\nВведи дату оплати клієнтом (ДД.ММ.РРРР):")
         await msg.edit_text("\n".join(lines), parse_mode="Markdown")
         return WAIT_DATE
 
