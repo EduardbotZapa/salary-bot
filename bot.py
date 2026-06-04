@@ -220,14 +220,20 @@ def _merge_payment_tranches(tranches: list) -> int:
     for t in tranches:
         inv = str(t["inv"]).strip()
         lst = PAYMENTS.setdefault(inv, [])
-        dup = any(
-            x.get("date") == t["date"] and round(float(x.get("amount", 0) or 0), 2) == round(float(t.get("amount", 0) or 0), 2)
-            for x in lst
-        )
-        if dup:
+        new_rate = round(float(t.get("rate", 0) or 0), 4)
+        existing = None
+        for x in lst:
+            if x.get("date") == t["date"] and round(float(x.get("amount", 0) or 0), 2) == round(float(t.get("amount", 0) or 0), 2):
+                existing = x
+                break
+        if existing is not None:
+            # Same date+amount already stored: refresh the rate if a fresh valid
+            # one is available (fixes old tranches frozen at a wrong 52,72 курс).
+            if new_rate > 0 and round(float(existing.get("rate", 0) or 0), 4) != new_rate:
+                existing["rate"] = new_rate
             continue
         lst.append({"date": t["date"], "amount": round(float(t.get("amount", 0) or 0), 2),
-                    "rate": round(float(t.get("rate", 0) or 0), 4)})
+                    "rate": new_rate})
         added += 1
     # keep tranches sorted by date
     for inv, lst in PAYMENTS.items():
@@ -924,7 +930,7 @@ def build_excel(manager_name, invoices, month):
     return path
 
 # ── States ────────────────────────────────────────────────────────────────────
-WAIT_NAME, WAIT_DATE, WAIT_STOCK, WAIT_DELIVERY, WAIT_EXCEL, WAIT_RATES, WAIT_PAYMENTS = range(7)
+WAIT_NAME, WAIT_DATE, WAIT_STOCK, WAIT_DELIVERY, WAIT_EXCEL, WAIT_RATES, WAIT_PAYMENTS, WAIT_SUMA = range(8)
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -939,7 +945,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/clear — очистити місяць\n"
             "/name — змінити ім'я\n"
             "/sheet — посилання на Google таблицю"
-            + ("\n/admin — всі менеджери\n/update — оновити довідник\n/rates — оновити курси валют\n/oplata — завантажити дати оплат" if update.effective_user.id in ADMIN_IDS else "")
+            + ("\n/admin — всі менеджери\n/update — оновити довідник\n/rates — оновити курси валют\n/oplata — завантажити дати оплат\n/suma — вписати суму рахунку (старі рах.)\n/perekurs — перерахувати курси оплат" if update.effective_user.id in ADMIN_IDS else "")
         )
     else:
         await update.message.reply_text("👋 Привіт! Як тебе звати? (введи ім'я)")
@@ -1795,12 +1801,20 @@ async def handle_rates_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
         rates_new = {}
+        skipped_junk = 0
         for _, row in df.iterrows():
             try:
                 d = row[date_col]
                 if pd.isna(d): continue
+                # skip junk/placeholder dates (e.g. 01.01.1900 from a malformed cell)
+                if hasattr(d, "year") and d.year < 2000:
+                    skipped_junk += 1
+                    continue
                 date_str = d.strftime("%d.%m.%Y") if hasattr(d, "strftime") else str(d)[:10]
-                buy = float(str(row[buy_col]).replace(",", "."))
+                if date_str.endswith("1900"):
+                    skipped_junk += 1
+                    continue
+                buy = float(re.sub(r"[^\d.,\-]", "", str(row[buy_col])).replace(",", "."))
                 if buy > 0:
                     rates_new[date_str] = buy
             except: pass
@@ -1814,6 +1828,7 @@ async def handle_rates_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(
             f"✅ *Курси оновлено!*\n\n"
             f"📅 Дат: *{len(rates_new)}*\n"
+            f"🗑 Пропущено сміття: {skipped_junk}\n"
             f"📆 Від {min(rates_new.keys())} до {max(rates_new.keys())}",
             parse_mode="Markdown"
         )
@@ -2170,6 +2185,103 @@ async def handle_payments_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ── Manual invoice totals (Сума рахунку) for old invoices ────────────────────
+async def cmd_suma(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin: set invoice totals (виторг) by hand for invoices not in the bot."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Немає доступу.")
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "🧾 Введи суми рахунків (виторг), по рядку на рахунок:\n"
+        "`65 = 146268`\n`66 = 29886`\n\n"
+        "Можна й через пробіл: `65 146268`.\n"
+        "Це потрібно для старих рахунків, яких немає в боті — щоб він зрозумів, "
+        "коли рахунок «закрито» і чи треба коригування 50/50.",
+        parse_mode="Markdown"
+    )
+    return WAIT_SUMA
+
+def _parse_amount(s: str) -> float:
+    s = str(s).replace(" ", "").replace("\xa0", "")
+    if s.count(",") and s.count("."):
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except:
+        return 0.0
+
+async def handle_suma_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return ConversationHandler.END
+    text = update.message.text or ""
+    added = {}
+    for line in text.splitlines():
+        # "рах.65 = 146268", "65: 146268", "65 - 146268" or "65 146268"
+        m = re.match(r"\s*(?:рах\.?\s*№?\s*)?(\d+)\s*[=:\-]\s*([\d\s.,]+)", line, re.IGNORECASE) \
+            or re.match(r"\s*(?:рах\.?\s*№?\s*)?(\d+)\s+([\d][\d\s.,]{2,})", line, re.IGNORECASE)
+        if not m:
+            continue
+        inv = m.group(1)
+        val = _parse_amount(m.group(2))
+        if val > 0:
+            INVOICE_TOTALS[str(inv)] = round(val, 2)
+            added[inv] = round(val, 2)
+    if not added:
+        await update.message.reply_text(
+            "❌ Не розпізнав жодного рядка. Формат: `65 = 146268`",
+            parse_mode="Markdown"
+        )
+        return WAIT_SUMA
+    _save_invoice_totals()
+    _ensure_payments_loaded()
+    sheet_ok = _write_payments_sheet(invoice_revenue_map_all())
+    lines = [f"✅ *Збережено сум рахунків: {len(added)}*"]
+    for inv, v in list(added.items())[:10]:
+        paid = total_paid(inv)
+        if paid > 0:
+            st = "закрито" if paid >= v * 0.995 else "часткова"
+            lines.append(f"• рах.{inv}: сума {v:,.0f}, оплачено {paid:,.0f} → {st}".replace(",", " "))
+        else:
+            lines.append(f"• рах.{inv}: сума {v:,.0f} (оплат ще немає)".replace(",", " "))
+    if len(added) > 10:
+        lines.append(f"…та ще {len(added) - 10}")
+    lines.append("\n📊 Вкладка *Оплати* оновлена ✓" if sheet_ok else "\n⚠️ Google Sheets недоступний (збережено локально)")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    return ConversationHandler.END
+
+# ── Recompute all stored payment rates from the archive/NBU ──────────────────
+async def cmd_perekurs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin: re-resolve the курс of every stored tranche (unfreezes old 52,72)."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Немає доступу.")
+        return
+    _ensure_payments_loaded()
+    msg = await update.message.reply_text("⏳ Перераховую курси по всіх збережених оплатах...")
+    rate_cache = {}
+    changed = 0
+    for inv, lst in PAYMENTS.items():
+        for t in lst:
+            d = t.get("date", "")
+            if not d:
+                continue
+            if d not in rate_cache:
+                rate_cache[d] = await get_payment_rate(d) or 0.0
+            nr = round(float(rate_cache[d]), 4)
+            if nr > 0 and round(float(t.get("rate", 0) or 0), 4) != nr:
+                t["rate"] = nr
+                changed += 1
+    _save_payments()
+    sheet_ok = _write_payments_sheet(invoice_revenue_map_all())
+    await msg.edit_text(
+        f"✅ *Курси перераховано.*\n"
+        f"🔁 Оновлено траншів: *{changed}*\n"
+        + ("📊 Вкладка *Оплати* оновлена ✓" if sheet_ok else "⚠️ Google Sheets недоступний"),
+        parse_mode="Markdown"
+    )
+
+
 async def cmd_sheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if SHEET_ID:
         await update.message.reply_text(
@@ -2188,6 +2300,7 @@ def main():
             CommandHandler("update", cmd_update),
             CommandHandler("rates", cmd_rates),
             CommandHandler("oplata", cmd_oplata),
+            CommandHandler("suma", cmd_suma),
         ],
         states={
             WAIT_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, set_name)],
@@ -2210,6 +2323,7 @@ def main():
                 ), handle_payments_excel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_payments_text),
             ],
+            WAIT_SUMA: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_suma_text)],
         },
         fallbacks=[CommandHandler("start", start)],
         allow_reentry=True,
@@ -2218,6 +2332,7 @@ def main():
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("sheet", cmd_sheet))
+    app.add_handler(CommandHandler("perekurs", cmd_perekurs))
     app.add_handler(CallbackQueryHandler(callback_clear, pattern="^clear_"))
     logger.info("Bot started")
     app.run_polling(drop_pending_updates=True)
