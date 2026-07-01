@@ -719,7 +719,7 @@ def build_excel(manager_name, invoices, month):
     return path
 
 # ── States ────────────────────────────────────────────────────────────────────
-WAIT_NAME, WAIT_DATE, WAIT_STOCK, WAIT_DELIVERY, WAIT_EXCEL, WAIT_RATES = range(6)
+WAIT_NAME, WAIT_DATE, WAIT_STOCK, WAIT_DELIVERY, WAIT_EXCEL, WAIT_RATES, WAIT_PRICES = range(7)
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -733,7 +733,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/report — Excel з ЗП за місяць\n"
             "/clear — очистити місяць\n"
             "/name — змінити ім'я"
-            + ("\n/admin — всі менеджери\n/update — оновити довідник\n/rates — оновити курси валют" if update.effective_user.id in ADMIN_IDS else "")
+            + ("\n/admin — всі менеджери\n/update — оновити довідник\n/rates — оновити курси валют\n/prices — оновити мінімальні ціни (прайс)" if update.effective_user.id in ADMIN_IDS else "")
         )
     else:
         await update.message.reply_text("👋 Привіт! Як тебе звати? (введи ім'я)")
@@ -1306,6 +1306,117 @@ async def handle_rates_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
+async def cmd_prices(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin only: update minimum sale prices (price_lookup) from Excel file"""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Немає доступу.")
+        return
+    await update.message.reply_text(
+        "📂 Надішли Excel файл з мінімальними цінами (.xlsx)\n"
+        "Аркуш *Stock_EU*, колонки *Article* / *Price UA* "
+        "(і другу пару *Article.1* / *Price UA.1*, якщо є).",
+        parse_mode="Markdown"
+    )
+    return WAIT_PRICES
+
+async def handle_prices_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Process uploaded price Excel and rebuild price_lookup.json"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return ConversationHandler.END
+
+    doc = update.message.document
+    if not doc.file_name.endswith(".xlsx"):
+        await update.message.reply_text("❌ Потрібен .xlsx файл")
+        return WAIT_PRICES
+
+    msg = await update.message.reply_text("⏳ Оновлюю мінімальні ціни...")
+    try:
+        import pandas as pd
+        import os as os_mod
+
+        file = await ctx.bot.get_file(doc.file_id)
+        xlsx_path = str(DATA_DIR / f"prices_{doc.file_id}.xlsx")
+        await file.download_to_drive(xlsx_path)
+
+        xl = pd.ExcelFile(xlsx_path)
+        # Prefer the Stock_EU sheet; fall back to the first sheet
+        sheet = next((s for s in xl.sheet_names if s.strip().lower() == "stock_eu"),
+                     xl.sheet_names[0])
+        df = pd.read_excel(xl, sheet_name=sheet, header=0)
+        df.columns = [str(c).strip() for c in df.columns]
+        os_mod.remove(xlsx_path)
+
+        def clean_article(raw) -> str:
+            art = str(raw).strip()
+            if not art or art.lower() == "nan":
+                return ""
+            # Drop leading row-number prefix ("12  6ES7..." -> "6ES7...")
+            parts = art.split()
+            if parts and parts[0].isdigit():
+                art = " ".join(parts[1:])
+            return art.strip()
+
+        def clean_price(raw) -> float:
+            try:
+                val = str(raw).replace(",", ".").replace(" ", "")
+                return float(val) if val and val.lower() != "nan" else 0
+            except:
+                return 0
+
+        # Column pairs to scan: (Article, Price UA) + (Article.1, Price UA.1) + ...
+        pairs = []
+        for art_col in df.columns:
+            low = art_col.lower()
+            if low == "article" or low.startswith("article."):
+                suffix = art_col[len("Article"):]  # "" or ".1"
+                price_col = f"Price UA{suffix}"
+                if price_col in df.columns:
+                    pairs.append((art_col, price_col))
+        # Fallback: if headers differ, take first two columns as art/price
+        if not pairs and len(df.columns) >= 2:
+            pairs.append((df.columns[0], df.columns[1]))
+
+        price_new = {}
+        for art_col, price_col in pairs:
+            for _, row in df.iterrows():
+                art = clean_article(row.get(art_col, ""))
+                if not art:
+                    continue
+                price = clean_price(row.get(price_col, 0))
+                if price > 0:
+                    price_new[art] = price
+
+        if not price_new:
+            await msg.edit_text(
+                "❌ Не знайшов жодної ціни. Перевір аркуш *Stock_EU* "
+                "та колонки *Article* / *Price UA*.",
+                parse_mode="Markdown"
+            )
+            return ConversationHandler.END
+
+        with open("price_lookup.json", "w", encoding="utf-8") as f:
+            json.dump(price_new, f, ensure_ascii=False, indent=2)
+
+        PRICE_LOOKUP.clear()
+        PRICE_LOOKUP.update(price_new)
+
+        sample = list(price_new.items())[:3]
+        sample_str = "\n".join(f"• `{a}` → {p:g} EUR" for a, p in sample)
+        await msg.edit_text(
+            f"✅ *Мінімальні ціни оновлено!*\n\n"
+            f"📦 Артикулів: *{len(price_new)}*\n"
+            f"📋 Аркуш: {sheet} | пар колонок: {len(pairs)}\n\n"
+            f"{sample_str}",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Prices update error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        await msg.edit_text(f"❌ Помилка: {e}")
+
+    return ConversationHandler.END
+
 async def handle_excel_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Process uploaded Excel and rebuild all 3 lookup files"""
     if update.effective_user.id not in ADMIN_IDS:
@@ -1497,6 +1608,7 @@ def main():
             CommandHandler("name", cmd_name),
             CommandHandler("update", cmd_update),
             CommandHandler("rates", cmd_rates),
+            CommandHandler("prices", cmd_prices),
         ],
         states={
             WAIT_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, set_name)],
@@ -1513,6 +1625,9 @@ def main():
             WAIT_EXCEL: [MessageHandler(filters.Document.MimeType(
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             ), handle_excel_update)],
+            WAIT_PRICES: [MessageHandler(filters.Document.MimeType(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ), handle_prices_update)],
         },
         fallbacks=[CommandHandler("start", start)],
         allow_reentry=True,
@@ -1520,6 +1635,7 @@ def main():
     app.add_handler(conv)
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("rates", cmd_rates))
+    app.add_handler(CommandHandler("prices", cmd_prices))
     app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("sheet", cmd_sheet))
