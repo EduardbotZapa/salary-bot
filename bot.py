@@ -1264,30 +1264,47 @@ async def handle_rates_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         xlsx_path = str(DATA_DIR / f"rates_{doc.file_id}.xlsx")
         await file.download_to_drive(xlsx_path)
 
+        # Read RAW (no header assumption): works both for files WITH a header
+        # row ("Дата"/"Курс продажи") and files WITHOUT one (data from row 1).
         xl = pd.ExcelFile(xlsx_path)
-        df = pd.read_excel(xl, sheet_name=0, header=1)
-        df.columns = [str(c).strip() for c in df.columns]
+        df = pd.read_excel(xl, sheet_name=0, header=None)
         import os as os_mod
         os_mod.remove(xlsx_path)
 
-        # Find date and buy columns
-        date_col = next((c for c in df.columns if 'дат' in c.lower() or 'date' in c.lower()), df.columns[0])
-        # Accept both buy/sell column names - just take the rate column (2nd column)
-        buy_col = next(
-            (c for c in df.columns if 'покуп' in c.lower() or 'buy' in c.lower() or 'курс' in c.lower()),
-            df.columns[1]
-        )
+        def _parse_rate_date(d) -> str:
+            if pd.isna(d):
+                return ""
+            if hasattr(d, "strftime"):
+                return d.strftime("%d.%m.%Y")
+            ds = str(d).strip()[:10]
+            for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y"):
+                try:
+                    return datetime.strptime(ds, fmt).strftime("%d.%m.%Y")
+                except:
+                    pass
+            return ""  # header text / junk -> skipped
 
+        # Column 0 = date, column 1 = rate. Any header row is skipped naturally
+        # because its first cell won't parse as a date.
         rates_new = {}
         for _, row in df.iterrows():
+            if len(row) < 2:
+                continue
+            date_str = _parse_rate_date(row.iloc[0])
+            if not date_str:
+                continue
             try:
-                d = row[date_col]
-                if pd.isna(d): continue
-                date_str = d.strftime("%d.%m.%Y") if hasattr(d, "strftime") else str(d)[:10]
-                buy = float(str(row[buy_col]).replace(",", "."))
-                if buy > 0:
-                    rates_new[date_str] = buy
-            except: pass
+                buy = float(str(row.iloc[1]).replace(",", ".").replace(" ", ""))
+            except:
+                continue
+            if buy > 0:
+                rates_new[date_str] = buy
+
+        if not rates_new:
+            await msg.edit_text(
+                "❌ Не знайшов жодного курсу. Формат: 1-а колонка — дата, 2-а — курс."
+            )
+            return ConversationHandler.END
 
         with open("rates.json", "w", encoding="utf-8") as f:
             json.dump(rates_new, f, ensure_ascii=False, indent=2)
@@ -1295,10 +1312,15 @@ async def handle_rates_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         RATES.clear()
         RATES.update(rates_new)
 
+        def _dkey(s):
+            try: return datetime.strptime(s, "%d.%m.%Y")
+            except: return datetime.min
+        dmin = min(rates_new.keys(), key=_dkey)
+        dmax = max(rates_new.keys(), key=_dkey)
         await msg.edit_text(
             f"✅ *Курси оновлено!*\n\n"
             f"📅 Дат: *{len(rates_new)}*\n"
-            f"📆 Від {min(rates_new.keys())} до {max(rates_new.keys())}",
+            f"📆 Від {dmin} до {dmax}",
             parse_mode="Markdown"
         )
     except Exception as e:
