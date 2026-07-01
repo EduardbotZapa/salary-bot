@@ -1313,10 +1313,8 @@ async def cmd_prices(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "📂 Надішли Excel файл з мінімальними цінами (.xlsx)\n"
-        "Читаю всі аркуші Stock_* (Stock_EU, Stock_UA...), "
-        "колонки *Article* / *Price UA*.\n"
-        "Якщо артикул є на кількох аркушах — беру *більшу* ціну.",
-        parse_mode="Markdown"
+        "Читаю всі аркуші Stock_* (Stock_EU, Stock_UA...), колонки Article / Price UA.\n"
+        "Якщо артикул є на кількох аркушах — беру більшу ціну."
     )
     return WAIT_PRICES
 
@@ -1410,8 +1408,7 @@ async def handle_prices_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not price_new:
             await msg.edit_text(
                 "❌ Не знайшов жодної ціни. Перевір аркуші Stock_* "
-                "та колонки Article / Price UA.",
-                parse_mode="Markdown"
+                "та колонки Article / Price UA."
             )
             return ConversationHandler.END
 
