@@ -1313,8 +1313,9 @@ async def cmd_prices(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "📂 Надішли Excel файл з мінімальними цінами (.xlsx)\n"
-        "Аркуш *Stock_EU*, колонки *Article* / *Price UA* "
-        "(і другу пару *Article.1* / *Price UA.1*, якщо є).",
+        "Читаю всі аркуші Stock_* (Stock_EU, Stock_UA...), "
+        "колонки *Article* / *Price UA*.\n"
+        "Якщо артикул є на кількох аркушах — беру *більшу* ціну.",
         parse_mode="Markdown"
     )
     return WAIT_PRICES
@@ -1339,12 +1340,11 @@ async def handle_prices_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await file.download_to_drive(xlsx_path)
 
         xl = pd.ExcelFile(xlsx_path)
-        # Prefer the Stock_EU sheet; fall back to the first sheet
-        sheet = next((s for s in xl.sheet_names if s.strip().lower() == "stock_eu"),
-                     xl.sheet_names[0])
-        df = pd.read_excel(xl, sheet_name=sheet, header=0)
-        df.columns = [str(c).strip() for c in df.columns]
-        os_mod.remove(xlsx_path)
+        # Read EVERY "Stock_*" sheet (Stock_EU, Stock_UA, ...). If none match,
+        # fall back to all sheets in the file.
+        stock_sheets = [s for s in xl.sheet_names if s.strip().lower().startswith("stock")]
+        if not stock_sheets:
+            stock_sheets = list(xl.sheet_names)
 
         def clean_article(raw) -> str:
             art = str(raw).strip()
@@ -1363,33 +1363,54 @@ async def handle_prices_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except:
                 return 0
 
-        # Column pairs to scan: (Article, Price UA) + (Article.1, Price UA.1) + ...
-        pairs = []
-        for art_col in df.columns:
-            low = art_col.lower()
-            if low == "article" or low.startswith("article."):
-                suffix = art_col[len("Article"):]  # "" or ".1"
-                price_col = f"Price UA{suffix}"
-                if price_col in df.columns:
-                    pairs.append((art_col, price_col))
-        # Fallback: if headers differ, take first two columns as art/price
-        if not pairs and len(df.columns) >= 2:
-            pairs.append((df.columns[0], df.columns[1]))
-
         price_new = {}
-        for art_col, price_col in pairs:
-            for _, row in df.iterrows():
-                art = clean_article(row.get(art_col, ""))
-                if not art:
-                    continue
-                price = clean_price(row.get(price_col, 0))
-                if price > 0:
-                    price_new[art] = price
+        per_sheet = {}   # sheet -> count, for the report
+        for sheet in stock_sheets:
+            try:
+                df = pd.read_excel(xl, sheet_name=sheet, header=0)
+            except Exception as e:
+                logger.warning(f"Prices sheet {sheet} read error: {e}")
+                continue
+            df.columns = [str(c).strip() for c in df.columns]
+
+            # Column pairs on this sheet: (Article, Price UA) + (Article.1, ...)
+            pairs = []
+            for art_col in df.columns:
+                low = art_col.lower()
+                if low == "article" or low.startswith("article."):
+                    suffix = art_col[len("Article"):]  # "" or ".1"
+                    price_col = f"Price UA{suffix}"
+                    if price_col in df.columns:
+                        pairs.append((art_col, price_col))
+            # Fallback: locate an article-ish and a price-ish column by name
+            if not pairs:
+                art_c = next((c for c in df.columns if "article" in c.lower() or "артикул" in c.lower()), None)
+                price_c = next((c for c in df.columns if "price" in c.lower() or "ціна" in c.lower() or "цена" in c.lower()), None)
+                if art_c and price_c:
+                    pairs.append((art_c, price_c))
+
+            cnt = 0
+            for art_col, price_col in pairs:
+                for _, row in df.iterrows():
+                    art = clean_article(row.get(art_col, ""))
+                    if not art:
+                        continue
+                    price = clean_price(row.get(price_col, 0))
+                    if price <= 0:
+                        continue
+                    # On conflict across sheets keep the MAXIMUM price
+                    prev = price_new.get(art)
+                    if prev is None or price > prev:
+                        price_new[art] = price
+                    cnt += 1
+            per_sheet[sheet] = cnt
+
+        os_mod.remove(xlsx_path)
 
         if not price_new:
             await msg.edit_text(
-                "❌ Не знайшов жодної ціни. Перевір аркуш *Stock_EU* "
-                "та колонки *Article* / *Price UA*.",
+                "❌ Не знайшов жодної ціни. Перевір аркуші Stock_* "
+                "та колонки Article / Price UA.",
                 parse_mode="Markdown"
             )
             return ConversationHandler.END
@@ -1400,12 +1421,14 @@ async def handle_prices_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         PRICE_LOOKUP.clear()
         PRICE_LOOKUP.update(price_new)
 
+        sheets_str = ", ".join(f"`{s}` ({per_sheet.get(s,0)})" for s in stock_sheets if s in per_sheet)
         sample = list(price_new.items())[:3]
         sample_str = "\n".join(f"• `{a}` → {p:g} EUR" for a, p in sample)
         await msg.edit_text(
             f"✅ *Мінімальні ціни оновлено!*\n\n"
-            f"📦 Артикулів: *{len(price_new)}*\n"
-            f"📋 Аркуш: {sheet} | пар колонок: {len(pairs)}\n\n"
+            f"📦 Унікальних артикулів: *{len(price_new)}*\n"
+            f"📋 Аркуші: {sheets_str}\n"
+            f"⚖️ При збігу артикула береться *більша* ціна\n\n"
             f"{sample_str}",
             parse_mode="Markdown"
         )
